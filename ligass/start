@@ -1,0 +1,63 @@
+#!/bin/bash
+set -e
+cd "$(dirname "$0")"
+
+echo "=== Bot Startup Script ==="
+
+# ── 1. .venv check / create ──────────────────────────────────────────────────
+if [ -d .venv ]; then
+  if [ ! -x .venv/bin/python3 ] || ! .venv/bin/python3 --version >/dev/null 2>&1; then
+    echo "[!] Broken .venv found — removing and recreating..."
+    mv .venv .venv_broken_$(date +%s)
+  fi
+fi
+
+if [ ! -d .venv ]; then
+  echo "[*] Creating virtual environment..."
+  python3 -m venv .venv
+fi
+
+# ── 2. Activate .venv ────────────────────────────────────────────────────────
+source .venv/bin/activate
+echo "[✓] .venv activated — using: $(which python3)"
+
+# ── 3. Install / update dependencies ─────────────────────────────────────────
+echo "[*] Installing dependencies..."
+pip install --upgrade pip -q
+pip install -r requirements.txt -q
+echo "[✓] Dependencies ready"
+
+# ── 4. Kill ALL existing bot instances (any path, any user) ──────────────────
+echo "[*] Stopping any running bot instances..."
+# Kill by script name (covers all paths)
+pkill -f 'python.*ligass\.py' 2>/dev/null && echo "[✓] Old instance killed" || echo "[✓] No running instance found"
+
+# Extra safety: kill by saved PID if present
+if [ -f bot.pid ]; then
+  OLD_PID=$(cat bot.pid)
+  if kill -0 "$OLD_PID" 2>/dev/null; then
+    kill "$OLD_PID" 2>/dev/null && echo "[✓] Killed PID $OLD_PID"
+  fi
+  rm -f bot.pid
+fi
+
+# Wait a moment so Telegram drops the old polling session
+sleep 3
+
+# ── 5. Start fresh instance ───────────────────────────────────────────────────
+echo "[*] Starting bot..."
+nohup ./.venv/bin/python3 ligass.py >> bot.log 2>&1 &
+BOT_PID=$!
+echo $BOT_PID > bot.pid
+echo "[✓] Bot started with PID $BOT_PID"
+
+# ── 6. Verify it is actually running ─────────────────────────────────────────
+sleep 5
+if kill -0 $BOT_PID 2>/dev/null; then
+  echo "[✓] Bot is running successfully!"
+  echo "    Logs: tail -f bot.log"
+else
+  echo "[✗] Bot crashed on startup! Check bot.log:"
+  tail -30 bot.log
+  exit 1
+fi
