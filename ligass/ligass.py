@@ -3039,6 +3039,26 @@ class WinGoBotEnhanced:
     async def send_media_group(self, context: ContextTypes.DEFAULT_TYPE, channel_id, media_items):
         if not media_items:
             return
+
+        # Prefer copy_message when source reference exists; avoids broken/expired file_id issues
+        copied_any = False
+        copy_failed = False
+        for item in media_items:
+            src_chat = item.get('source_chat_id')
+            src_msg = item.get('source_message_id')
+            if src_chat and src_msg:
+                try:
+                    await context.bot.copy_message(chat_id=channel_id, from_chat_id=src_chat, message_id=src_msg)
+                    copied_any = True
+                except Exception as e:
+                    copy_failed = True
+                    logging.warning(f"⚠️ copy_message failed for {channel_id}: {e}")
+            else:
+                copy_failed = True
+
+        if copied_any and not copy_failed:
+            logging.info(f"✅ Media copied successfully to {channel_id}")
+            return
             
         if len(media_items) > 1:
             formatted_media_group = []
@@ -3340,6 +3360,36 @@ class WinGoBotEnhanced:
                     await self.send_stored_message(context, channel, message_data)
 
         logging.info(f"✅ Night messages sent: {success_count}/{len(self.active_channels)}")
+
+    async def send_break_message_for_channel(self, context: ContextTypes.DEFAULT_TYPE, channel, next_session):
+        try:
+            if not self.is_channel_enabled(channel):
+                return False
+            channel_next_session = self.get_next_session_time_for_channel(channel)
+            await self.send_event_message(
+                context, channel, 'break',
+                next_session=channel_next_session or next_session,
+                break_duration=self.custom_break_duration
+            )
+
+            channel_config = self.get_channel_config(channel)
+            if channel_config.get('custom_break_enabled', False):
+                messages = self.get_custom_break_messages(channel)
+                if messages:
+                    delay_minutes = channel_config.get('custom_break_delay', 5)
+                    for message_index, message_data in enumerate(messages):
+                        message_delay = (delay_minutes * 60) + (message_index * 60)
+                        task = asyncio.create_task(
+                            self.send_custom_break_message_delayed(
+                                context, channel, message_index, message_delay
+                            )
+                        )
+                        task_key = f"{channel}:{message_index}"
+                        self.scheduled_tasks[task_key] = task
+            return True
+        except Exception as e:
+            logging.error(f"❌ Exception sending break message to {channel}: {e}")
+            return False
 
     async def send_break_message(self, context: ContextTypes.DEFAULT_TYPE, next_session):
         await self.cancel_scheduled_tasks()
@@ -6339,7 +6389,7 @@ Templates Preview:
                             continue
                         if channel not in break_sent_for_channel or break_sent_for_channel[channel] != current_time[:2]:
                             next_session = self.get_next_session_time_for_channel(channel)
-                            await self.send_break_message(context, next_session)
+                            await self.send_break_message_for_channel(context, channel, next_session)
                             break_sent_for_channel[channel] = current_time[:2]
                             session_start_sent_for_channel = {k: v for k, v in session_start_sent_for_channel.items() if not k.startswith(f"{channel}:")}
                 
