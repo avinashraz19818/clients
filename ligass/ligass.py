@@ -142,7 +142,7 @@ class WinGoBotEnhanced:
         # Per-channel custom schedule times (format: ["HH:MM", "HH:MM"])
         self.channel_custom_schedules = {}  # {channel_id: [start_time, end_time, ...]}
 
-        # Prediction message tracking
+        # Prediction message tracking - FIXED: Store message info with sent_via flag
         self.prediction_message_ids = {}  # {channel_id: {period: {'message_id': id, 'sent_via_user': bool}}}
         self.loss_prediction_history = {}  # {channel_id: [{'period': period, 'message_id': id, 'sent_via_user': bool}]}
         self.cycle_prediction_ids = {}
@@ -247,51 +247,51 @@ class WinGoBotEnhanced:
             'custom': 'Custom'
         }
 
-        # Default message templates with 12-hour format
+        # Default message templates with 12-hour format - FIXED: Removed <emoji> tags for regular emojis
         self.default_templates = {
             "good_morning": """
-<blockquote>{fire1}<b>𝗚𝗢𝗢𝗗 𝗠𝗢𝗥𝗡𝗜𝗡𝗚 𝗪𝗜𝗡𝗡𝗘𝗥𝗦</b>{fire1}</blockquote>
+<blockquote>🔥<b>𝗚𝗢𝗢𝗗 𝗠𝗢𝗥𝗡𝗜𝗡𝗚 𝗪𝗜𝗡𝗡𝗘𝗥𝗦</b>🔥</blockquote>
 
-{sun} <b>Welcome to a new winning session</b>
-{alarm1} <b>Prediction Time:</b> {prediction_times}
-{tick} <b>Accuracy mode active</b>
-{rarrow} <b>Get ready for today's signals</b>
+🌅 <b>Welcome to a new winning session</b>
+⏰ <b>Prediction Time:</b> {prediction_times}
+✅ <b>Accuracy mode active</b>
+➡️ <b>Get ready for today's signals</b>
 
-{star2} <b>Today's Schedule:</b>
+🌟 <b>Today's Schedule:</b>
 {schedule_list}
 """,
             "good_night": """
-<blockquote>{moon}<b>𝗚𝗢𝗢𝗗 𝗡𝗜𝗚𝗛𝗧 𝗪𝗜𝗡𝗡𝗘𝗥𝗦</b>{moon}</blockquote>
+<blockquote>🌙<b>𝗚𝗢𝗢𝗗 𝗡𝗜𝗚𝗛𝗧 𝗪𝗜𝗡𝗡𝗘𝗥𝗦</b>🌙</blockquote>
 
-{sleep} <b>Today's prediction session has ended</b>
-{trophy} <b>Wins:</b> {wins}   <b>Losses:</b> {losses}
-{chart} <b>Win Rate:</b> {win_rate:.1f}%
-{alarm1} <b>Next Start:</b> {next_start}
+💤 <b>Today's prediction session has ended</b>
+🏆 <b>Wins:</b> {wins}   <b>Losses:</b> {losses}
+📊 <b>Win Rate:</b> {win_rate:.1f}%
+⏰ <b>Next Start:</b> {next_start}
 
-{reload} <b>See you tomorrow at the next session</b>
+🔄 <b>See you tomorrow at the next session</b>
 """,
             "break_message": """
-<blockquote>{alarm1}<b>𝗕𝗥𝗘𝗔𝗞 𝗧𝗜𝗠𝗘</b>{alarm1}</blockquote>
+<blockquote>⏰<b>𝗕𝗥𝗘𝗔𝗞 𝗧𝗜𝗠𝗘</b>⏰</blockquote>
 
-{clock} <b>Break Duration:</b> {break_duration} Minutes
-{rarrow} <b>Next Session:</b> {next_session}
-{tick} <b>Please wait for the next accurate prediction</b>
+⏰ <b>Break Duration:</b> {break_duration} Minutes
+➡️ <b>Next Session:</b> {next_session}
+✅ <b>Please wait for the next accurate prediction</b>
 
-{reload} <b>We will be back soon</b>
+🔄 <b>We will be back soon</b>
 """,
             "new_session": """
-<blockquote>{fire1}<b>𝗡𝗘𝗪 𝗦𝗘𝗦𝗦𝗜𝗢𝗡 𝗦𝗧𝗔𝗥𝗧𝗘𝗗</b>{fire1}</blockquote>
+<blockquote>🔥<b>𝗡𝗘𝗪 𝗦𝗘𝗦𝗦𝗜𝗢𝗡 𝗦𝗧𝗔𝗥𝗧𝗘𝗗</b>🔥</blockquote>
 
-{alarm1} <b>Session:</b> {session}
-{tick} <b>Prediction mode is now active</b>
-{rarrow} <b>Stay ready for the next signal</b>
+⏰ <b>Session:</b> {session}
+✅ <b>Prediction mode is now active</b>
+➡️ <b>Stay ready for the next signal</b>
 """,
             "single_prediction": """
-<blockquote>{fire1}<b>𝗝𝗔𝗜 𝗖𝗟𝗨𝗕 𝟭 𝗠𝗜𝗡 𝗢𝗙𝗙𝗜𝗖𝗜𝗔𝗟</b>{fire1}</blockquote>
+<blockquote>💰<b>𝗧𝗘𝗔𝗠 𝗟𝗜𝗚𝗔𝗦𝗦 1 MINUTE OFFICIAL</b>💰</blockquote>
 
-{alarm1} <b>{session}</b> {alarm1}
+🔥 <b>ᴡɪɴɢᴏ ❶ ᴍɪɴᴜᴛᴇ</b> 🔥
 
-{tick} <b><u>{period}</u></b> {rarrow} <a href="{register_link}"><b>{prediction}</b></a>
+✅ <b><u>{period}</u></b> ➡️ <a href="{register_link}"><b>{prediction}</b></a>
 """
         }
         self.custom_break_messages = {}
@@ -1129,41 +1129,40 @@ class WinGoBotEnhanced:
             'period': period_text,
             'session': self.get_session_name_for_channel(channel_id),
             'prediction': prediction_text,
-            'crown': self.get_emoji('crown', for_channel),
-            'link': self.get_emoji('link', for_channel),
-            'fire': self.get_emoji('fire', for_channel),
-            'sparkles': self.get_emoji('sparkles', for_channel),
-            'rocket': self.get_emoji('rocket', for_channel),
-            'money': self.get_emoji('money', for_channel),
-            'fire1': self.get_emoji('fire1', for_channel),
-            'alarm1': self.get_emoji('alarm1', for_channel),
-            'tick': self.get_emoji('tick', for_channel),
-            'rarrow': self.get_emoji('rarrow', for_channel),
-            'check': self.get_emoji('check', for_channel),
-            'chart': self.get_emoji('chart', for_channel),
-            'target': self.get_emoji('target', for_channel),
-            'trophy': self.get_emoji('trophy', for_channel),
-            'gift': self.get_emoji('gift', for_channel),
-            'lightning': self.get_emoji('lightning', for_channel),
-            'star': self.get_emoji('star', for_channel),
-            'warning': self.get_emoji('warning', for_channel),
-            'clock': self.get_emoji('clock', for_channel),
-            'moon': self.get_emoji('moon', for_channel),
-            'sun': self.get_emoji('sun', for_channel),
-            'coffee': self.get_emoji('coffee', for_channel),
-            'sleep': self.get_emoji('sleep', for_channel),
-            'break_icon': self.get_emoji('break_icon', for_channel),
-            'reload': self.get_emoji('reload', for_channel),
-            'party': self.get_emoji('party', for_channel),
-            'money_loss': self.get_emoji('money_loss', for_channel),
-            'star2': self.get_emoji('star2', for_channel)
+            'crown': "👑",
+            'link': "🔗",
+            'fire': "🔥",
+            'sparkles': "✨",
+            'rocket': "🚀",
+            'money': "💰",
+            'fire1': "🔥",
+            'alarm1': "⏰",
+            'tick': "✅",
+            'rarrow': "➡️",
+            'check': "✅",
+            'chart': "📊",
+            'target': "🎯",
+            'trophy': "🏆",
+            'gift': "🎁",
+            'lightning': "⚡",
+            'star': "⭐",
+            'warning': "⚠️",
+            'clock': "⏰",
+            'moon': "🌙",
+            'sun': "🌅",
+            'coffee': "☕",
+            'sleep': "💤",
+            'break_icon': "⏸️",
+            'reload': "🔄",
+            'party': "🎉",
+            'money_loss': "💸",
+            'star2': "🌟"
         }
         
         formatted_text = template
         for k, v in format_dict.items():
             formatted_text = formatted_text.replace(f"{{{k}}}", str(v))
         
-        formatted_text = self.format_with_emojis(formatted_text, for_channel)
         return formatted_text
 
     # ============= MESSAGE SENDING METHODS =============
@@ -1269,10 +1268,9 @@ class WinGoBotEnhanced:
                 else:
                     if not text or not text.strip():
                         return False
-                    clean_text = self.strip_premium_emoji_tags(text)
                     result = await context.bot.send_message(
                         chat_id=chat_id,
-                        text=clean_text,
+                        text=text,
                         parse_mode=ParseMode.HTML
                     )
                     return result
@@ -1415,11 +1413,6 @@ class WinGoBotEnhanced:
             logging.error(f"❌ User account send failed for {chat_id}: {e}")
             return False
 
-    def strip_premium_emoji_tags(self, text):
-        if not text:
-            return text
-        return re.sub(r'<emoji[^>]*>([^<]*)</emoji>', r'\1', text)
-
     async def send_event_message(self, context, channel_id, event_type, **kwargs):
         event_type = self.normalize_event_type(event_type)
 
@@ -1502,30 +1495,30 @@ class WinGoBotEnhanced:
             'win_rate': kwargs.get('win_rate', 0),
             'break_duration': kwargs.get('break_duration', self.custom_break_duration),
             'register_link': channel_config['register_link'],
-            'crown': self.get_emoji('crown', True),
-            'sparkles': self.get_emoji('sparkles', True),
-            'check': self.get_emoji('check', True),
-            'chart': self.get_emoji('chart', True),
-            'link': self.get_emoji('link', True),
-            'sun': self.get_emoji('sun', True),
-            'moon': self.get_emoji('moon', True),
-            'sleep': self.get_emoji('sleep', True),
-            'clock': self.get_emoji('clock', True),
-            'reload': self.get_emoji('reload', True),
-            'rocket': self.get_emoji('rocket', True),
-            'break_icon': self.get_emoji('break_icon', True),
-            'target': self.get_emoji('target', True),
-            'trophy': self.get_emoji('trophy', True),
-            'fire': self.get_emoji('fire', True),
-            'money': self.get_emoji('money', True),
-            'lightning': self.get_emoji('lightning', True),
-            'coffee': self.get_emoji('coffee', True),
-            'gift': self.get_emoji('gift', True),
-            'fire1': self.get_emoji('fire1', True),
-            'alarm1': self.get_emoji('alarm1', True),
-            'tick': self.get_emoji('tick', True),
-            'rarrow': self.get_emoji('rarrow', True),
-            'star2': self.get_emoji('star2', True),
+            'crown': "👑",
+            'sparkles': "✨",
+            'check': "✅",
+            'chart': "📊",
+            'link': "🔗",
+            'sun': "🌅",
+            'moon': "🌙",
+            'sleep': "💤",
+            'clock': "⏰",
+            'reload': "🔄",
+            'rocket': "🚀",
+            'break_icon': "⏸️",
+            'target': "🎯",
+            'trophy': "🏆",
+            'fire': "🔥",
+            'money': "💰",
+            'lightning': "⚡",
+            'coffee': "☕",
+            'gift': "🎁",
+            'fire1': "🔥",
+            'alarm1': "⏰",
+            'tick': "✅",
+            'rarrow': "➡️",
+            'star2': "🌟",
             'prediction_times': self.get_channel_prediction_times_text(channel_id),
             'schedule_list': self.get_channel_schedule_list_text(channel_id),
             'next_start': next_start
@@ -1535,8 +1528,6 @@ class WinGoBotEnhanced:
             formatted_text = template.format(**format_dict)
         except KeyError:
             formatted_text = template
-        
-        formatted_text = self.format_with_emojis(formatted_text, for_channel=True)
         
         if not formatted_text or not formatted_text.strip():
             formatted_text = f"{event_type.replace('_', ' ').title()} update"
@@ -1658,24 +1649,32 @@ class WinGoBotEnhanced:
             return False
 
     async def track_loss_prediction(self, context, channel_id, period):
+        """Track a loss prediction and delete oldest if more than 3"""
         message_info = self.prediction_message_ids.get(channel_id, {}).get(period)
         if not message_info:
             logging.warning(f"⚠️ No message_id found for loss prediction {period} in {channel_id}")
             return
+        
+        # Initialize loss history for channel if not exists
         if channel_id not in self.loss_prediction_history:
             self.loss_prediction_history[channel_id] = []
+        
+        # Add current loss prediction to history
         self.loss_prediction_history[channel_id].append({
             'period': period,
             'message_id': message_info['message_id'],
             'sent_via_user': message_info.get('sent_via_user', False)
         })
         logging.info(f"📌 Loss prediction tracked for {channel_id}: {period} -> {message_info['message_id']} | total={len(self.loss_prediction_history[channel_id])}")
+        
+        # Delete oldest if more than max allowed
         while len(self.loss_prediction_history[channel_id]) > self.max_loss_predictions_keep:
             oldest = self.loss_prediction_history[channel_id].pop(0)
             logging.info(f"🗑️ Deleting old loss prediction for {channel_id}: {oldest['period']} (ID: {oldest['message_id']})")
             await self.delete_channel_message(context, channel_id, oldest['message_id'], oldest.get('sent_via_user', False))
 
     async def clear_loss_history_on_win(self, channel_id):
+        """Clear loss history on win"""
         if channel_id in self.loss_prediction_history and self.loss_prediction_history[channel_id]:
             cleared_count = len(self.loss_prediction_history[channel_id])
             self.loss_prediction_history[channel_id] = []
@@ -1684,6 +1683,7 @@ class WinGoBotEnhanced:
         return False
 
     def reset_loss_prediction_history(self, channel_id=None):
+        """Reset loss prediction history"""
         if channel_id is None:
             self.loss_prediction_history = {}
         else:
@@ -1698,7 +1698,7 @@ class WinGoBotEnhanced:
         
         if text_content:
             text_content = self.format_placeholders(text_content, channel_id, **placeholders)
-            formatted_text = self.format_custom_message_with_premium_emojis(text_content, channel_id)
+            formatted_text = text_content
         else:
             formatted_text = None
 
@@ -1932,9 +1932,10 @@ class WinGoBotEnhanced:
                     self.last_prediction_was_loss = False
                     self.last_result_was_win = True
                     
-                    # Send win media to all active channels that are currently in session
+                    # Clear loss history for all channels on win
                     for channel in self.active_channels:
                         if self.is_channel_prediction_active(channel) and self.is_channel_active(channel):
+                            await self.clear_loss_history_on_win(channel)
                             logging.info(f"🎉 Sending win media to {channel}")
                             await self.send_event_message(context, channel, 'win')
                 else:
@@ -1944,9 +1945,11 @@ class WinGoBotEnhanced:
                     self.last_prediction_was_loss = True
                     self.last_result_was_win = False
                     
-                    # Send loss media to all active channels that are currently in session
+                    # Track loss for all active channels
                     for channel in self.active_channels:
                         if self.is_channel_prediction_active(channel) and self.is_channel_active(channel):
+                            # Track this loss prediction for deletion later
+                            await self.track_loss_prediction(context, channel, self.current_prediction_period)
                             logging.info(f"❌ Sending loss media to {channel}")
                             await self.send_event_message(context, channel, 'loss')
                 
@@ -2097,7 +2100,7 @@ class WinGoBotEnhanced:
         if channel_id not in self.channel_configs:
             self.channel_configs[channel_id] = {
                 'register_link': "https://bdgsg.com//#/register?invitationCode=5151329947",
-                'promotional_text': "{gift} Register now and get DAILY FREE GIFT CODE! {gift}",
+                'promotional_text': "🎁 Register now and get DAILY FREE GIFT CODE! 🎁",
                 'show_links': True,
                 'show_promo': True,
                 'templates': self.default_templates.copy(),
@@ -2410,35 +2413,35 @@ class WinGoBotEnhanced:
     def load_emoji_config(self):
         default_emoji_config = {
             "premium_emojis": {
-                "fire": "<emoji id=5420315771991497307>🔥</emoji>",
-                "crown": "<emoji id=6266995104687330978>👑</emoji>",
-                "sparkles": "<emoji id=6285088169817805553>✨</emoji>",
-                "rocket": "<emoji id=5188481279963715781>🚀</emoji>",
-                "money": "<emoji id=6267068789146260253>💰</emoji>",
-                "chart": "<emoji id=5431577498364158238>📊</emoji>",
-                "target": "<emoji id=5310278924616356636>🎯</emoji>",
-                "trophy": "<emoji id=5413566144986503832>🏆</emoji>",
-                "gift": "<emoji id=5384578448633129482>🎁</emoji>",
-                "lightning": "<emoji id=6267107057304868214>⚡</emoji>",
-                "star": "<emoji id=5435957248314579621>⭐</emoji>",
-                "warning": "<emoji id=6267039884016358504>⚠️</emoji>",
-                "check": "<emoji id=6267008582294705964>✅</emoji>",
-                "cross": "<emoji id=5343968063970632884>❌</emoji>",
-                "clock": "<emoji id=5386415655253730366>⏰</emoji>",
-                "link": "<emoji id=4958689671950369798>🔗</emoji>",
-                "moon": "<emoji id=5208554136039073738>🌙</emoji>",
-                "sun": "<emoji id=5413883478645169306>🌅</emoji>",
-                "coffee": "<emoji id=5451959871257713464>☕</emoji>",
-                "sleep": "<emoji id=5359543311897998264>💤</emoji>",
-                "break_icon": "<emoji id=5359543311897998264>⏸️</emoji>",
-                "reload": "<emoji id=5264727218734524899>🔄</emoji>",
-                "party": "<emoji id=5436040291507247633>🎉</emoji>",
-                "money_loss": "<emoji id=5472030678633684592>💸</emoji>",
-                "star2": "<emoji id=5458799228719472718>🌟</emoji>",
-                "fire1": "<emoji id=5402406965252989103>🔥</emoji>",
-                "alarm1": "<emoji id=5368295871131695793>⏰</emoji>",
-                "tick": "<emoji id=5208893571599449245>✅</emoji>",
-                "rarrow": "<emoji id=6127194666526841786>➡️</emoji>",
+                "fire": "🔥",
+                "crown": "👑",
+                "sparkles": "✨",
+                "rocket": "🚀",
+                "money": "💰",
+                "chart": "📊",
+                "target": "🎯",
+                "trophy": "🏆",
+                "gift": "🎁",
+                "lightning": "⚡",
+                "star": "⭐",
+                "warning": "⚠️",
+                "check": "✅",
+                "cross": "❌",
+                "clock": "⏰",
+                "link": "🔗",
+                "moon": "🌙",
+                "sun": "🌅",
+                "coffee": "☕",
+                "sleep": "💤",
+                "break_icon": "⏸️",
+                "reload": "🔄",
+                "party": "🎉",
+                "money_loss": "💸",
+                "star2": "🌟",
+                "fire1": "🔥",
+                "alarm1": "⏰",
+                "tick": "✅",
+                "rarrow": "➡️",
             },
             "regular_emojis": {
                 "fire": "🔥",
@@ -3844,7 +3847,7 @@ Select what to change:"""
                     if channel not in self.channel_configs:
                         self.channel_configs[channel] = {
                             'register_link': "https://bdgsg.com//#/register?invitationCode=5151329947",
-                            'promotional_text': "{gift} Register now and get DAILY FREE GIFT CODE! {gift}",
+                            'promotional_text': "🎁 Register now and get DAILY FREE GIFT CODE! 🎁",
                             'show_links': True,
                             'show_promo': True,
                             'templates': self.default_templates.copy()
