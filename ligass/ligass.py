@@ -152,7 +152,7 @@ class WinGoBotEnhanced:
         self.prediction_message_ids = {}  # {channel_id: {period: {'message_id': id, 'sent_via_user': bool}}}
         self.prediction_history = {}  # {channel_id: [{'period': period, 'message_id': id, 'sent_via_user': bool, 'result': 'win'/'loss'/'pending'}]}
         self.cycle_prediction_ids = {}
-        self.max_predictions_keep = 3  # Keep only last 3 predictions (win or loss)
+        self.max_predictions_keep = 3  # Keep only last 2 losses + current win inside an active block
         self.last_sent_prediction_period = None
 
         # Break control
@@ -181,8 +181,7 @@ class WinGoBotEnhanced:
         self.user_state = {}
         self.session_predictions = []
 
-        # Advanced prediction tracking
-        self.prediction_history = []
+        # Advanced prediction tracking - removed duplicate, using dict from line 153
         self.last_10_results = []
         self.pattern_memory = deque(maxlen=1000)
         self.number_memory = deque(maxlen=1000)
@@ -1826,87 +1825,92 @@ class WinGoBotEnhanced:
 
     async def track_prediction(self, context, channel_id, period, result='pending'):
         """Track prediction (win or loss) following user's exact rules."""
-        channel_key = str(channel_id)
-        period_key = str(period)
+        try:
+            channel_key = str(channel_id)
+            period_key = str(period)
 
-        # Get message info for this prediction
-        message_info = self.prediction_message_ids.get(channel_id, {}).get(period)
-        if not message_info:
-            message_info = self.prediction_message_ids.get(channel_key, {}).get(period_key)
-        if not message_info:
-            logging.warning(f"⚠️ No message_id found for prediction {period_key} in {channel_key}")
-            return
-
-        # Initialize prediction history for channel if needed
-        if channel_key not in self.prediction_history:
-            self.prediction_history[channel_key] = []
-
-        existing = self.prediction_history[channel_key]
-        
-        # Update existing prediction if found
-        for item in existing:
-            if str(item.get('period')) == period_key:
-                if result != 'pending':
-                    item['result'] = result
-                    logging.info(f"🔄 Updated prediction result for {channel_key}: {period_key} -> {result}")
+            # Get message info for this prediction
+            message_info = self.prediction_message_ids.get(channel_id, {}).get(period)
+            if not message_info:
+                message_info = self.prediction_message_ids.get(channel_key, {}).get(period_key)
+            if not message_info:
+                logging.warning(f"⚠️ No message_id found for prediction {period_key} in {channel_key}")
                 return
 
-        # Add current prediction to history
-        new_prediction = {
-            'period': period_key,
-            'message_id': message_info['message_id'],
-            'sent_via_user': message_info.get('sent_via_user', False),
-            'result': result,
-            'timestamp': datetime.now().isoformat()
-        }
-        existing.append(new_prediction)
-        logging.info(f"📌 Prediction tracked for {channel_key}: {period_key} -> {message_info['message_id']} (result={result}) | total={len(existing)}")
+            # Initialize prediction history for channel if needed
+            if channel_key not in self.prediction_history:
+                self.prediction_history[channel_key] = []
 
-        # Apply user's rule: when win happens, delete extra old losses before this win
-        try:
-            if result == 'win':
-                # Get all losses before this win
-                win_index = len(existing) - 1  # Index of newly added win
-                losses_before_win = []
-                for i in range(win_index):
-                    if existing[i].get('result') == 'loss':
-                        losses_before_win.append(existing[i])
-                
-                # If more than 2 losses before this win, delete oldest ones
-                if len(losses_before_win) > 2:
-                    losses_to_delete = losses_before_win[:-2]  # All except last 2
-                    for loss_to_delete in losses_to_delete:
-                        logging.info(f"🗑️ Deleting old loss before win for {channel_key}: {loss_to_delete['period']}")
-                        existing.remove(loss_to_delete)
-                        await self.delete_channel_message(
-                            context,
-                            channel_id,
-                            loss_to_delete['message_id'],
-                            loss_to_delete.get('sent_via_user', False)
-                        )
+            existing = self.prediction_history[channel_key]
             
-            # Ensure we have only 3 predictions total (latest)
-            while len(existing) > 3:
-                oldest = existing.pop(0)
-                logging.info(f"🗑️ Deleting oldest prediction for {channel_key}: {oldest['period']} (ID: {oldest['message_id']})")
-                await self.delete_channel_message(
-                    context,
-                    channel_id,
-                    oldest['message_id'],
-                    oldest.get('sent_via_user', False)
-                )
+            # Ensure existing is a list (safety check)
+            if not isinstance(existing, list):
+                logging.error(f"❌ prediction_history[{channel_key}] is not a list: {type(existing)}")
+                self.prediction_history[channel_key] = []
+                existing = self.prediction_history[channel_key]
+            
+            # Update existing prediction if found
+            for item in existing:
+                if str(item.get('period')) == period_key:
+                    if result != 'pending':
+                        item['result'] = result
+                        logging.info(f"🔄 Updated prediction result for {channel_key}: {period_key} -> {result}")
+                    return
+
+            # Add current prediction to history
+            new_prediction = {
+                'period': period_key,
+                'message_id': message_info['message_id'],
+                'sent_via_user': message_info.get('sent_via_user', False),
+                'result': result,
+                'timestamp': datetime.now().isoformat()
+            }
+            existing.append(new_prediction)
+            logging.info(f"📌 Prediction tracked for {channel_key}: {period_key} -> {message_info['message_id']} (result={result}) | total={len(existing)}")
+
+            # User rule:
+            # - keep prediction history until a WIN arrives
+            # - on WIN, keep only the last 2 losses before that WIN + the WIN itself
+            # - older already-completed groups remain in channel/history
+            if result == 'win':
+                win_index = None
+                for idx, item in enumerate(existing):
+                    if str(item.get('period')) == period_key:
+                        win_index = idx
+                        break
+
+                if win_index is not None:
+                    losses_before_current_win = [
+                        item for item in existing[:win_index]
+                        if item.get('result') == 'loss'
+                    ]
+
+                    if len(losses_before_current_win) > 2:
+                        losses_to_delete = losses_before_current_win[:-2]
+                        for loss_to_delete in losses_to_delete:
+                            logging.info(
+                                f"🗑️ Deleting old loss before win for {channel_key}: {loss_to_delete['period']}"
+                            )
+                            if loss_to_delete in existing:
+                                existing.remove(loss_to_delete)
+                                await self.delete_channel_message(
+                                    context,
+                                    channel_id,
+                                    loss_to_delete['message_id'],
+                                    loss_to_delete.get('sent_via_user', False)
+                                )
         except Exception as e:
-            logging.error(f"❌ Error in track_prediction cleanup: {e}")
-            logging.error(f"❌ existing type: {type(existing)}, len: {len(existing) if hasattr(existing, '__len__') else 'N/A'}")
-            if existing:
-                logging.error(f"❌ First item type: {type(existing[0]) if existing else 'N/A'}")
+            logging.error(f"❌ Error in track_prediction: {e}")
+            logging.error(f"❌ channel_id: {channel_id}, period: {period}, result: {result}")
+            import traceback
+            traceback.print_exc()
 
     async def track_loss_prediction(self, context, channel_id, period):
         """Backward compatibility: track loss prediction."""
         await self.track_prediction(context, channel_id, period, result='loss')
 
     async def clear_loss_history_on_win(self, channel_id):
-        """Backward compatibility: no longer needed as we keep only last 3 predictions regardless of win/loss."""
+        """Backward compatibility helper; win cleanup is handled in track_prediction."""
         return False
 
     def reset_prediction_history(self, channel_id=None):
@@ -2314,7 +2318,12 @@ class WinGoBotEnhanced:
                     is_active, _, _, _, _ = self.get_current_session_info()
                     if is_active:
                         for channel in self.active_channels:
-                            if self.is_channel_prediction_active(channel) and self.is_channel_in_schedule(channel):
+                            # Check if channel is active and in schedule (if method exists)
+                            in_schedule = True
+                            if hasattr(self, 'is_channel_in_schedule'):
+                                in_schedule = self.is_channel_in_schedule(channel)
+                            
+                            if self.is_channel_prediction_active(channel) and in_schedule:
                                 await self.send_event_message(context, channel, 'win', 
                                     prediction=self.current_prediction_choice,
                                     result=result,
@@ -2372,7 +2381,12 @@ class WinGoBotEnhanced:
                     is_active, _, _, _, _ = self.get_current_session_info()
                     if is_active:
                         for channel in self.active_channels:
-                            if self.is_channel_prediction_active(channel) and self.is_channel_in_schedule(channel):
+                            # Check if channel is active and in schedule (if method exists)
+                            in_schedule = True
+                            if hasattr(self, 'is_channel_in_schedule'):
+                                in_schedule = self.is_channel_in_schedule(channel)
+                            
+                            if self.is_channel_prediction_active(channel) and in_schedule:
                                 await self.send_event_message(context, channel, 'loss',
                                     prediction=self.current_prediction_choice,
                                     result=result,
@@ -3265,22 +3279,6 @@ class WinGoBotEnhanced:
             logging.error(f"❌ Failed to reconnect user client: {e}")
             self.user_client_connected = False
 
-    def normalize_schedule_slot(self, slot):
-        """Accept both {'start','end'} dicts and 'HH:MM-HH:MM' strings."""
-        if isinstance(slot, dict):
-            start = slot.get('start')
-            end = slot.get('end')
-            if start and end:
-                return {'start': str(start).strip(), 'end': str(end).strip()}
-            return None
-        if isinstance(slot, str) and '-' in slot:
-            start, end = slot.split('-', 1)
-            start = start.strip()
-            end = end.strip()
-            if start and end:
-                return {'start': start, 'end': end}
-        return None
-
     async def resolve_all_channels(self):
         if not self.user_app or not self.active_channels:
             return
@@ -3407,7 +3405,7 @@ class WinGoBotEnhanced:
             "• Session Start: 5 min before each session\n"
             "• Break Message: At end of each session\n\n"
             "🔄 AUTO-DELETE FEATURE:\n"
-            "• Keeps last 3 loss predictions only\n"
+            "• On WIN, keeps last 2 LOSS + current WIN\n"
             "• Old loss messages auto-deleted\n"
             "• Cleared on win\n\n"
             "Select an option below:",
@@ -3444,7 +3442,7 @@ class WinGoBotEnhanced:
                     "• Session Start: 5 min before each session\n"
                     "• Break Message: At end of each session\n\n"
                     "🔄 AUTO-DELETE FEATURE:\n"
-                    "• Keeps last 3 loss predictions only\n"
+                    "• On WIN, keeps last 2 LOSS + current WIN\n"
                     "• Old loss messages auto-deleted\n"
                     "• Cleared on win\n\n"
                     "Select an option:",
@@ -5005,16 +5003,11 @@ Select what to change:"""
                     if not schedule:
                         continue
                     
-                    normalized_schedule = [self.normalize_schedule_slot(slot) for slot in schedule]
-                    normalized_schedule = [slot for slot in normalized_schedule if slot]
-                    if not normalized_schedule:
-                        continue
-
                     # Find the last session of the day for this channel
-                    last_slot_end = max(normalized_schedule, key=lambda s: int(s['end'].split(':')[0]) * 60 + int(s['end'].split(':')[1]))
+                    last_slot_end = max(schedule, key=lambda s: int(s['end'].split(':')[0]) * 60 + int(s['end'].split(':')[1]))
                     last_slot_end_hour, last_slot_end_min = map(int, last_slot_end['end'].split(':'))
                     
-                    for slot in normalized_schedule:
+                    for slot in schedule:
                         try:
                             end_hour, end_min = map(int, slot['end'].split(':'))
                             slot_end_minutes = end_hour * 60 + end_min
