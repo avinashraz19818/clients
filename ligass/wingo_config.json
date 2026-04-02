@@ -1,0 +1,107 @@
+{
+  "admin_ids": [
+    6484788124
+  ],
+  "channels": [
+    "-1001836268475",
+    "-1003756185291"
+  ],
+  "channel_configs": {
+    "-1001836268475": {
+      "register_link": "https://bdgsg.com//#/register?invitationCode=5151329947",
+      "promotional_text": "\ud83c\udf81 Register now and get DAILY FREE GIFT CODE! \ud83c\udf81",
+      "show_links": true,
+      "show_promo": true,
+      "templates": {
+        "good_morning": "\n<blockquote>\ud83d\udd25<b>\ud835\uddda\ud835\udde2\ud835\udde2\ud835\uddd7 \ud835\udde0\ud835\udde2\ud835\udde5\ud835\udde1\ud835\udddc\ud835\udde1\ud835\uddda \ud835\uddea\ud835\udddc\ud835\udde1\ud835\udde1\ud835\uddd8\ud835\udde5\ud835\udde6</b>\ud83d\udd25</blockquote>\n\n\ud83c\udf05 <b>Welcome to a new winning session</b>\n\u23f0 <b>Prediction Time:</b> {prediction_times}\n\u2705 <b>Accuracy mode active</b>\n\u27a1\ufe0f <b>Get ready for today's signals</b>\n\n\ud83c\udf1f <b>Today's Schedule:</b>\n{schedule_list}\n",
+        "good_night": "\n<blockquote>\ud83c\udf19<b>\ud835\uddda\ud835\udde2\ud835\udde2\ud835\uddd7 \ud835\udde1\ud835\udddc\ud835\uddda\ud835\udddb\ud835\udde7 \ud835\uddea\ud835\udddc\ud835\udde1\ud835\udde1\ud835\uddd8\ud835\udde5\ud835\udde6</b>\ud83c\udf19</blockquote>\n\n\ud83d\udca4 <b>Today's prediction session has ended</b>\n\ud83c\udfc6 <b>Wins:</b> {wins}   <b>Losses:</b> {losses}\n\ud83d\udcca <b>Win Rate:</b> {win_rate:.1f}%\n\u23f0 <b>Next Start:</b> {next_start}\n\n\ud83d\udd04 <b>See you tomorrow at the next session</b>\n",
+        "break_message": "\n<blockquote>\u23f0<b>\ud835\uddd5\ud835\udde5\ud835\uddd8\ud835\uddd4\ud835\uddde \ud835\udde7\ud835\udddc\ud835\udde0\ud835\uddd8</b>\u23f0</blockquote>\n\n\u23f0 <b>Break Duration:</b> {break_duration} Minutes\n\u27a1\ufe0f <b>Next Session:</b> {next_session}\n\u2705 <b>Please wait for the next accurate prediction</b>\n\n\ud83d\udd04 <b>We will be back soon</b>\n",
+        "new_session": "\n<blockquote>\ud83d\udd25<b>\ud835\udde1\ud835\uddd8\ud835\uddea \ud835\udde6\ud835\uddd8\ud835\udde6\ud835\udde6\ud835\udddc\ud835\udde2\ud835\udde1 \ud835\udde6\ud835\udde7\ud835\uddd4\ud835\udde5\ud835\udde7\ud835\uddd8\ud835\uddd7</b>\ud83d\udd25</blockquote>\n\n\u23f0 <b>Session:</b> {session}\n\u2705 <b>Prediction mode is now active</b>\n\u27a1\ufe0f <b>Stay ready for the next signal</b>\n",
+        "single_prediction": "<blockquote>{money}<b>\ud835\udde7\ud835\uddd8\ud835\uddd4\ud835\udde0 \ud835\udddf\ud835\udddc\ud835\uddda\ud835\uddd4\ud835\udde6\ud835\udde6 1 MINUTE OFFICIAL</b>{money}</blockquote>\n\n{lightning} <b>Registration Link</b> :-\n<b>https://bdgwiny.com//#/register?invitationCode=1135259624</b> {lightning} \n\n {fire1} <b>\u1d21\u026a\u0274\u0262\u1d0f \u2776 \u1d0d\u026a\u0274\u1d1c\u1d1b\u1d07</b> {fire1}\n\n{tick}  <b>{period}</b>  {rarrow}<a href=\"{register_link}\"><b>{prediction}</b></a>"
+      }
+    },
+    "-1003756185291": {
+      "register_link": "https://bdgsg.com//#/register?invitationCode=5151329947",
+      "promotional_text": "\ud83c\udf81 Register now and get DAILY FREE GIFT CODE! \ud83c\udf81",
+      "show_links": true,
+      "show_promo": true,
+      "templates": {
+        "good_morning": "\n<blockquote>\ud83d\udd25<b>\ud835\uddda\ud835\udde2\ud835\udde2\ud835\uddd7 \ud835\udde0\ud835\udde2\ud835\udde5\ud835\udde1\ud835\udddc\ud835\udde1\ud835\uddda \ud835\uddea\ud835\udddc\ud835\udde1\ud835\udde1\ud835\uddd8\ud835\udde5\ud835\udde6</b>\ud83d\udd25</blockquote>\n\n\ud83c\udf05 <b>Welcome to a new winning session</b>\n\u23f0 <b>Prediction Time:</b> {prediction_times}\n\u2705 <b>Accuracy mode active</b>\n\u27a1\ufe0f <b>Get ready for today's signals</b>\n\n\ud83c\udf1f <b>Today's Schedule:</b>\n{schedule_list}\n",
+        "good_night": "\n<blockquote>\ud83c\udf19<b>\ud835\uddda\ud835\udde2\ud835\udde2\ud835\uddd7 \ud835\udde1\ud835\udddc\ud835\uddda\ud835\udddb\ud835\udde7 \ud835\uddea\ud835\udddc\ud835\udde1\ud835\udde1\ud835\uddd8\ud835\udde5\ud835\udde6</b>\ud83c\udf19</blockquote>\n\n\ud83d\udca4 <b>Today's prediction session has ended</b>\n\ud83c\udfc6 <b>Wins:</b> {wins}   <b>Losses:</b> {losses}\n\ud83d\udcca <b>Win Rate:</b> {win_rate:.1f}%\n\u23f0 <b>Next Start:</b> {next_start}\n\n\ud83d\udd04 <b>See you tomorrow at the next session</b>\n",
+        "break_message": "\n<blockquote>\u23f0<b>\ud835\uddd5\ud835\udde5\ud835\uddd8\ud835\uddd4\ud835\uddde \ud835\udde7\ud835\udddc\ud835\udde0\ud835\uddd8</b>\u23f0</blockquote>\n\n\u23f0 <b>Break Duration:</b> {break_duration} Minutes\n\u27a1\ufe0f <b>Next Session:</b> {next_session}\n\u2705 <b>Please wait for the next accurate prediction</b>\n\n\ud83d\udd04 <b>We will be back soon</b>\n",
+        "new_session": "\n<blockquote>\ud83d\udd25<b>\ud835\udde1\ud835\uddd8\ud835\uddea \ud835\udde6\ud835\uddd8\ud835\udde6\ud835\udde6\ud835\udddc\ud835\udde2\ud835\udde1 \ud835\udde6\ud835\udde7\ud835\uddd4\ud835\udde5\ud835\udde7\ud835\uddd8\ud835\uddd7</b>\ud83d\udd25</blockquote>\n\n\u23f0 <b>Session:</b> {session}\n\u2705 <b>Prediction mode is now active</b>\n\u27a1\ufe0f <b>Stay ready for the next signal</b>\n",
+        "single_prediction": "<blockquote>{money}<b>JAI CLUB 1 MINUTE OFFICIAL</b>{money}</blockquote>\n\n{lightning} <b>Registration Link</b> :-\n<b>https://www.jaiclub11.com/#/register?invitationCode=55451101920</b> {lightning} \n\n {fire1} <b>\u1d21\u026a\u0274\u0262\u1d0f \u2776 \u1d0d\u026a\u0274\u1d1c\u1d1b\u1d07</b> {fire1}\n\n{tick}  <b>{period}</b>  {rarrow}<a href=\"{register_link}\"><b>{prediction}</b></a>"
+      }
+    }
+  },
+  "channel_prediction_status": {
+    "-1001836268475": true,
+    "-1003756185291": true
+  },
+  "channel_subscriptions": {
+    "-1001836268475": {
+      "days": 33,
+      "expires_at": "2026-05-03T04:31:17.202063",
+      "alert_1d_sent": false,
+      "expired_sent": false
+    },
+    "-1003756185291": {
+      "days": 30,
+      "expires_at": "2026-04-30T04:43:13.945040",
+      "alert_1d_sent": false,
+      "expired_sent": false
+    }
+  },
+  "channel_custom_schedules": {
+    "-1001836268475": [
+      "10:00-11:00",
+      "14:00-15:00",
+      "17:00-18:00",
+      "20:00-21:00"
+    ],
+    "-1003756185291": [
+      "10:00-11:00",
+      "14:00-15:00",
+      "17:00-18:00",
+      "20:00-21:00"
+    ]
+  },
+  "custom_break_messages": {},
+  "custom_break_schedules": {},
+  "custom_break_duration": 60,
+  "event_media": {
+    "-1001836268475": {
+      "session_start": [
+        {
+          "type": "sticker",
+          "file_id": "CAACAgUAAxkBAAICN2nKVXlr6CR8Th1uzRRzvxBpkk8zAAIXEwACvmTQVn4hqlDaxy8AAToE",
+          "source_chat_id": 6484788124,
+          "source_message_id": 737
+        }
+      ],
+      "break": [
+        {
+          "type": "sticker",
+          "file_id": "CAACAgUAAxkBAAIC5WnLBCphQGxlJL4dDscM33lGNjk2AAJqEgAC9iLJVmKRQZShFnKfOgQ",
+          "source_chat_id": 6484788124,
+          "source_message_id": 742
+        },
+        {
+          "type": "sticker",
+          "file_id": "CAACAgUAAxkBAAICPmnKVYkGbSL_SmDmEYbGkQOzfc8lAALYEQACMazJVuD7AUjcPT_gOgQ",
+          "source_chat_id": 6484788124,
+          "source_message_id": 744
+        }
+      ],
+      "win": [
+        {
+          "type": "sticker",
+          "file_id": "CAACAgUAAxkBAAICMmnKVVp_7ARw7UoGo1LGmU4BkUpoAALmEAACjddJVB4SevOIcq2sOgQ",
+          "source_chat_id": 6484788124,
+          "source_message_id": 748
+        }
+      ]
+    }
+  },
+  "api_url": "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json"
+}
