@@ -5,6 +5,7 @@ import aiohttp
 import os
 import random
 import re
+from io import BytesIO
 from datetime import datetime, timedelta
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
                        InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAnimation)
@@ -81,7 +82,7 @@ class WinGoBotEnhanced:
         # Pyrogram User Account for premium emojis
         self.api_id = api_id
         self.api_hash = api_hash
-        self.phone = phone
+        self.phone = str(phone) if phone else None
         self.user_app = None
         self.user_client_initialized = False
         self.user_client_lock = asyncio.Lock()
@@ -91,18 +92,20 @@ class WinGoBotEnhanced:
         self.username_to_id = {}
         self.id_to_username = {}
         self.resolved_channels = set()
+        self.resolved_peers = {}
         self.failed_channels = set()
+        self.failed_peers = set()
         self.resolution_in_progress = False
         self.user_client_connected = False
         self.user_client_keepalive_task = None
         
         self.emoji_placeholders = {}
 
-        # ============= GLOBAL SCHEDULE =============
-        self.prediction_start_hour = 6      # 6:00 AM start
-        self.prediction_end_hour = 24        # 12:00 AM midnight end
-        self.prediction_active_minutes = 50  # 50 minutes of predictions
-        self.prediction_break_minutes = 10   # 10 minutes break
+        # ============= CUSTOM SCHEDULE =============
+        self.channel_schedules = {}  # Per-channel custom schedules
+        self.channel_out_of_schedule = set()  # Channels currently out of schedule
+        self.prediction_active_minutes = 60  # 60 minutes per session slot
+        self.prediction_break_minutes = 0   # No break between slots (handled by schedule)
         
         # Morning message at 5:00 AM
         self.morning_message_hour = 5
@@ -121,6 +124,7 @@ class WinGoBotEnhanced:
         # Break waiting for win - NEW
         self.waiting_for_win_before_break = {}  # {channel_id: True/False}
         self.pending_win_required = {}  # {channel_id: True/False}
+        self.pending_good_night = {}  # {channel_id: True/False} - for good night after last session
 
         # Session tracking
         self.current_session = ""
@@ -146,9 +150,10 @@ class WinGoBotEnhanced:
 
         # Prediction message tracking
         self.prediction_message_ids = {}  # {channel_id: {period: {'message_id': id, 'sent_via_user': bool}}}
-        self.loss_prediction_history = {}  # {channel_id: [{'period': period, 'message_id': id, 'sent_via_user': bool}]}
+        self.prediction_history = {}  # {channel_id: [{'period': period, 'message_id': id, 'sent_via_user': bool, 'result': 'win'/'loss'/'pending'}]}
         self.cycle_prediction_ids = {}
-        self.max_loss_predictions_keep = 3  # Keep only last 3 loss predictions
+        self.max_predictions_keep = 3  # Keep only last 3 predictions (win or loss)
+        self.last_sent_prediction_period = None
 
         # Break control
         self.pending_break = False
@@ -162,6 +167,9 @@ class WinGoBotEnhanced:
         self.current_prediction_period = None
         self.current_prediction_choice = None
         self.waiting_for_result = False
+        self.last_resolved_result_period = None
+        self.resolved_prediction_targets = set()
+        self.result_processing_in_progress = False
         self.break_message_sent = False
         self.last_result_was_win = False
         self.break_start_time = None
@@ -291,6 +299,24 @@ class WinGoBotEnhanced:
 {alarm1} <b>{session}</b> {alarm1}
 
 {tick} <b><u>{period}</u></b> {rarrow} <a href="{register_link}"><b>{prediction}</b></a>
+""",
+            "win": """
+<blockquote>{fire1}<b>🎉 WIN RESULT 🎉</b>{fire1}</blockquote>
+
+{trophy} <b>Prediction: {prediction}</b>
+{chart} <b>Result: {result}</b>
+{fire} <b>Status: WIN ✅</b>
+
+{sparkles} <b>Great prediction!</b>
+""",
+            "loss": """
+<blockquote>{fire1}<b>❌ LOSS RESULT ❌</b>{fire1}</blockquote>
+
+{trophy} <b>Prediction: {prediction}</b>
+{chart} <b>Result: {result}</b>
+{cross} <b>Status: LOSS</b>
+
+{reload} <b>Better luck next time!</b>
 """
         }
         self.custom_break_messages = {}
@@ -368,46 +394,62 @@ class WinGoBotEnhanced:
         return utc_now + timedelta(hours=5, minutes=30)
 
     def get_current_session_info(self):
-        """Get current session information in 12-hour format"""
+        """Get current session information based on custom schedules"""
         now = self.get_ist_now()
-        current_hour = now.hour
-        current_minute = now.minute
-        current_time_minutes = current_hour * 60 + current_minute
+        current_time_minutes = now.hour * 60 + now.minute
         
-        day_start = self.prediction_start_hour * 60
-        day_end = self.prediction_end_hour * 60
+        # Check if any channel is currently active
+        active_channels = []
+        for channel in self.active_channels:
+            if self.is_channel_in_schedule(channel):
+                active_channels.append(channel)
         
-        if current_time_minutes < day_start or current_time_minutes >= day_end:
-            return False, None, None, "06:00 AM", 0
+        if not active_channels:
+            return False, None, None, None, 0
         
-        hour_of_day = current_hour
-        minute_in_hour = current_minute
+        # Get the current active slot info from any active channel
+        for channel in active_channels:
+            start, end = self.get_channel_schedule_status(channel)
+            if start and end:
+                try:
+                    start_hour, start_min = map(int, start.split(':'))
+                    end_hour, end_min = map(int, end.split(':'))
+                    
+                    start_minutes = start_hour * 60 + start_min
+                    end_minutes = end_hour * 60 + end_min
+                    
+                    session_start_12h = self.format_time_12h(start_hour, start_min)
+                    session_end_12h = self.format_time_12h(end_hour, end_min)
+                    
+                    # Find next session
+                    next_session_start = None
+                    schedule = self.channel_schedules.get(channel, [])
+                    for slot in schedule:
+                        slot_start_hour, slot_start_min = map(int, slot['start'].split(':'))
+                        slot_start_minutes = slot_start_hour * 60 + slot_start_min
+                        if slot_start_minutes > current_time_minutes:
+                            next_session_start = self.format_time_12h(slot_start_hour, slot_start_min)
+                            break
+                    
+                    if not next_session_start:
+                        # Next session is tomorrow
+                        next_session_start = "Tomorrow"
+                    
+                    minutes_until_next = end_minutes - current_time_minutes
+                    
+                    return True, session_start_12h, session_end_12h, next_session_start, max(0, minutes_until_next)
+                except Exception:
+                    continue
         
-        if minute_in_hour < self.prediction_active_minutes:
-            is_active = True
-            session_start = self.format_time_12h(hour_of_day, 0)
-            session_end = self.format_time_12h(hour_of_day, self.prediction_active_minutes)
-            next_session_start = self.format_time_12h(hour_of_day, self.prediction_active_minutes)
-            minutes_until_next = self.prediction_active_minutes - minute_in_hour
-        else:
-            is_active = False
-            session_start = None
-            session_end = None
-            next_hour = hour_of_day + 1 if hour_of_day < 23 else 6
-            next_session_start = self.format_time_12h(next_hour, 0)
-            minutes_until_next = (60 - minute_in_hour) + (0 if next_hour != 6 else (24 - current_hour) * 60)
-        
-        return is_active, session_start, session_end, next_session_start, minutes_until_next
+        return False, None, None, None, 0
 
     def get_session_name(self):
-        """Get current session name in 12-hour format"""
+        """Get current session name based on custom schedules"""
         now = self.get_ist_now()
-        hour = now.hour
-        if hour >= self.prediction_start_hour and hour < self.prediction_end_hour:
-            if now.minute < self.prediction_active_minutes:
-                start_12h = self.format_time_12h(hour, 0)
-                end_12h = self.format_time_12h(hour, self.prediction_active_minutes)
-                return f"{start_12h}-{end_12h}"
+        for channel in self.active_channels:
+            start, end = self.get_channel_schedule_status(channel)
+            if start and end:
+                return f"{start}-{end}"
         return "BREAK"
     
     def get_session_key(self, channel_id, hour):
@@ -480,93 +522,75 @@ class WinGoBotEnhanced:
     # ============= API DATA FETCHING =============
     
     async def fetch_live_data(self):
-        """Fetch live data from working API"""
-        url = "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json"
+        url = self.config['api_url']
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json, text/plain, */*',
+            'Accept': '*/*',
             'Accept-Language': 'en-US,en;q=0.9',
             'Origin': 'https://draw.ar-lottery01.com',
             'Referer': 'https://draw.ar-lottery01.com/',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive'
+            'Accept-Encoding': 'gzip, deflate, br'
         }
         
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                timeout = aiohttp.ClientTimeout(total=15, connect=10)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url, headers=headers) as response:
-                        if response.status != 200:
-                            if attempt < max_retries - 1:
-                                await asyncio.sleep(2 ** attempt)
-                                continue
-                            return None
-                        
-                        try:
-                            data = await response.json()
-                        except:
-                            text = await response.text()
-                            try:
-                                data = json.loads(text)
-                            except:
-                                if attempt < max_retries - 1:
-                                    await asyncio.sleep(2 ** attempt)
-                                    continue
-                                return None
-                        
-                        if data.get('data') and data['data'].get('list'):
-                            data_list = data['data']['list']
-                            formatted_data = []
-                            
-                            for item in data_list:
-                                try:
-                                    number_str = str(item.get('number', '0'))
-                                    number_clean = ''.join(filter(str.isdigit, number_str))
-                                    number = int(number_clean[0]) if number_clean else 0
-                                    
-                                    formatted_item = {
-                                        'issueNumber': item.get('issueNumber'),
-                                        'number': number,
-                                        'color': self.get_color(number),
-                                        'big_small': self.get_big_small(number),
-                                        'premium': item.get('premium', ''),
-                                        'sum': item.get('sum', '')
-                                    }
-                                    formatted_data.append(formatted_item)
-                                except Exception:
-                                    continue
-                            
-                            for item in formatted_data[:20]:
-                                self.pattern_memory.append({
-                                    'result': item['big_small'],
-                                    'number': item['number'],
-                                    'timestamp': datetime.now()
-                                })
-                                self.number_memory.append(item['number'])
-                                self.recent_results.append(item['big_small'])
-                                self.recent_numbers.append(item['number'])
-                                self.big_small_history.append(item['big_small'])
-                                self.number_distribution[item['number']] += 1
-                                self.last_actual_results.append(item['big_small'])
-                            
-                            return formatted_data
-                        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=15) as response:
+                    if response.status != 200:
+                        logging.error(f"API returned status code: {response.status}")
                         return None
+                    
+                    content_type = response.headers.get('Content-Type', '').lower()
+                    
+                    if 'application/json' in content_type:
+                        data = await response.json()
+                    else:
+                        text_content = await response.text()
+                        try:
+                            data = json.loads(text_content)
+                        except json.JSONDecodeError:
+                            logging.error("Failed to parse response")
+                            return None
+                    
+                    if data.get('data') and data['data'].get('list'):
+                        data_list = data['data']['list']
+                        formatted_data = []
+                        for item in data_list:
+                            try:
+                                number_str = str(item.get('number', '0'))
+                                number_clean = ''.join(filter(str.isdigit, number_str))
+                                number = int(number_clean[0]) if number_clean else 0
+                                
+                                formatted_item = {
+                                    'issueNumber': item.get('issueNumber'),
+                                    'number': number,
+                                    'color': self.get_color(number),
+                                    'big_small': self.get_big_small(number),
+                                    'premium': item.get('premium', ''),
+                                    'sum': item.get('sum', '')
+                                }
+                                formatted_data.append(formatted_item)
+                            except Exception as e:
+                                continue
                         
-            except asyncio.TimeoutError:
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)
-                else:
+                        for item in formatted_data[:20]:
+                            self.pattern_memory.append({
+                                'result': item['big_small'],
+                                'number': item['number'],
+                                'timestamp': datetime.utcnow()
+                            })
+                            self.number_memory.append(item['number'])
+                            self.recent_results.append(item['big_small'])
+                            self.recent_numbers.append(item['number'])
+                            self.big_small_history.append(item['big_small'])
+                            self.number_distribution[item['number']] += 1
+                            self.last_actual_results.append(item['big_small'])
+                        
+                        return formatted_data if formatted_data else None
                     return None
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)
-                else:
-                    return None
-        
-        return None
+                    
+        except Exception as e:
+            logging.error(f"Error fetching data: {e}")
+            return None
 
     def get_big_small(self, num):
         return 'SMALL' if num <= 4 else 'BIG'
@@ -878,12 +902,21 @@ class WinGoBotEnhanced:
             return None, 0.5
 
     def analyze_pattern_advanced(self, data_list):
+        """Use AI for pattern analysis"""
+        return self.analyze_pattern_with_ai(data_list)
+
+    def analyze_pattern_with_ai(self, data_list):
+        """Analyze pattern using AI + Traditional methods"""
         if not data_list or len(data_list) < 10:
             return random.choice(['BIG', 'SMALL']), 50
         
         recent_data = data_list[:50]
         results = [item['big_small'] for item in recent_data]
         numbers = [item['number'] for item in recent_data]
+        
+        logging.info(f"🧠 AI Pattern Analysis")
+        logging.info(f"Last 10 results: {results[:10]}")
+        logging.info(f"Last 10 numbers: {numbers[:10]}")
         
         ai_prediction, ai_confidence = self.predict_with_ai(results, numbers)
         
@@ -897,20 +930,36 @@ class WinGoBotEnhanced:
         if ai_prediction and ai_confidence > self.ai_confidence_threshold:
             final_prediction = ai_prediction
             final_confidence = ai_confidence * 100
+            logging.info(f"🤖 AI Prediction: {ai_prediction} ({ai_confidence:.2%} confidence)")
+            
+            if self.ai_accuracy > 0.7:
+                self.pattern_weights['ai_pattern'] = 0.55
+            else:
+                self.pattern_weights['ai_pattern'] = 0.45
         else:
             final_prediction = trad_prediction
             final_confidence = trad_confidence
+            logging.info(f"📊 Traditional Prediction: {trad_prediction} ({trad_confidence:.1f}%)")
         
-        if self.consecutive_losses >= 2:
+        if self.consecutive_losses >= 3:
+            logging.info(f"🔴 CRITICAL: {self.consecutive_losses} consecutive losses!")
             final_prediction = 'BIG' if final_prediction == 'SMALL' else 'SMALL'
-            final_confidence = max(final_confidence, 70)
+            final_confidence = 75
         
         recent_predictions = list(self.big_small_history)
-        if len(recent_predictions) >= 5 and all(p == final_prediction for p in recent_predictions[-5:]):
-            final_prediction = 'BIG' if final_prediction == 'SMALL' else 'SMALL'
-            final_confidence = max(60, final_confidence - 10)
+        if len(recent_predictions) >= 5:
+            recent_predictions = recent_predictions[-5:]
+            if all(p == final_prediction for p in recent_predictions):
+                logging.info(f"⚠️ Too many consecutive {final_prediction} predictions, flipping...")
+                final_prediction = 'BIG' if final_prediction == 'SMALL' else 'SMALL'
+                final_confidence = max(60, final_confidence - 10)
         
+        self.big_small_history.append(final_prediction)
         self.last_ai_confidence = ai_confidence if ai_prediction else 0
+        
+        logging.info(f"🎯 FINAL PREDICTION: {final_prediction} ({final_confidence:.1f}%)")
+        logging.info(f"📈 AI Accuracy: {self.ai_accuracy:.2%}")
+        logging.info("=" * 60)
         
         return final_prediction, final_confidence
 
@@ -1426,10 +1475,71 @@ class WinGoBotEnhanced:
 
         media_items = self.get_event_media(channel_id, event_type)
         
-        # Send win/loss media immediately
-        if event_type in ['win', 'loss'] and media_items:
-            logging.info(f"📸 Sending {event_type} media to {channel_id}")
-            await self.send_media_group(context, channel_id, media_items)
+        # Send win/loss media only (text message controlled by setting)
+        if event_type in ['win', 'loss']:
+            channel_config = self.get_channel_config(channel_id)
+            send_text = channel_config.get('send_win_loss_text', True)  # Default: True
+            
+            # Send text message if enabled
+            if send_text:
+                template_key = event_type
+                template = self.get_channel_template(channel_id, template_key)
+                if template and template.strip():
+                    format_dict = {
+                        'prediction': kwargs.get('prediction', ''),
+                        'result': kwargs.get('result', ''),
+                        'session': kwargs.get('session', ''),
+                        'register_link': channel_config['register_link'],
+                        'crown': self.get_emoji('crown', True),
+                        'sparkles': self.get_emoji('sparkles', True),
+                        'check': self.get_emoji('check', True),
+                        'chart': self.get_emoji('chart', True),
+                        'link': self.get_emoji('link', True),
+                        'sun': self.get_emoji('sun', True),
+                        'moon': self.get_emoji('moon', True),
+                        'sleep': self.get_emoji('sleep', True),
+                        'clock': self.get_emoji('clock', True),
+                        'reload': self.get_emoji('reload', True),
+                        'rocket': self.get_emoji('rocket', True),
+                        'break_icon': self.get_emoji('break_icon', True),
+                        'target': self.get_emoji('target', True),
+                        'trophy': self.get_emoji('trophy', True),
+                        'fire': self.get_emoji('fire', True),
+                        'money': self.get_emoji('money', True),
+                        'lightning': self.get_emoji('lightning', True),
+                        'coffee': self.get_emoji('coffee', True),
+                        'gift': self.get_emoji('gift', True),
+                        'fire1': self.get_emoji('fire1', True),
+                        'alarm1': self.get_emoji('alarm1', True),
+                        'cross': self.get_emoji('cross', True),
+                        'warning': self.get_emoji('warning', True),
+                        'party': self.get_emoji('party', True),
+                        'star2': self.get_emoji('star2', True),
+                        'rarrow': self.get_emoji('rarrow', True),
+                        'tick': self.get_emoji('tick', True)
+                    }
+                    
+                    formatted_text = template
+                    for k, v in format_dict.items():
+                        formatted_text = formatted_text.replace(f"{{{k}}}", str(v))
+                    
+                    formatted_text = self.format_with_emojis(formatted_text, for_channel=True)
+                    
+                    if formatted_text.strip():
+                        await self.send_message_with_retry(
+                            context=context,
+                            chat_id=channel_id,
+                            text=formatted_text,
+                            for_channel=True
+                        )
+                        logging.info(f"✅ {event_type} text message sent to {channel_id}")
+            
+            # Send media if available
+            if media_items:
+                logging.info(f"📸 Sending {event_type} media to {channel_id}")
+                sent = await self.send_media_group(context, channel_id, media_items)
+                logging.info(f"📸 {event_type} media send status for {channel_id}: {sent}")
+                return bool(sent)
             return True
 
         if use_custom:
@@ -1439,6 +1549,8 @@ class WinGoBotEnhanced:
                     local_message_data['send_order'] = 'media_first'
                 elif event_type == 'session_start':
                     local_message_data['send_order'] = 'text_first'
+                # Check if message_data already has media, if so don't send media_items separately
+                has_media_in_message = bool(local_message_data.get('media_group'))
                 await self.send_stored_message(
                     context, channel_id, local_message_data,
                     session=kwargs.get('session', ''),
@@ -1448,11 +1560,9 @@ class WinGoBotEnhanced:
                     win_rate=kwargs.get('win_rate', 0),
                     break_duration=kwargs.get('break_duration', self.custom_break_duration)
                 )
-            if media_items:
-                if event_type == 'break':
-                    await self.send_media_group(context, channel_id, media_items)
-                else:
-                    await self.send_media_group(context, channel_id, media_items)
+            # Only send media_items if custom message doesn't have its own media
+            if media_items and not any(msg.get('media_group') for msg in custom_messages):
+                await self.send_media_group(context, channel_id, media_items)
             return True
 
         template_key = {
@@ -1536,58 +1646,127 @@ class WinGoBotEnhanced:
 
         return True
 
+    async def download_media_for_user_account(self, file_id, context):
+        """Download media file for user account sending"""
+        try:
+            file = await context.bot.get_file(file_id)
+            file_bytes = await file.download_as_bytearray()
+            file_stream = BytesIO(file_bytes)
+            
+            if hasattr(file, 'file_path') and file.file_path:
+                filename = file.file_path.split('/')[-1]
+            else:
+                filename = f"media_{file_id}.jpg"
+            
+            file_stream.name = filename
+            return file_stream
+            
+        except Exception as e:
+            logging.error(f"❌ Failed to download media for user account: {e}")
+            return None
+
+    async def send_media_item_stable(self, context, channel_id, media_item):
+        """Send event media via bot API (most reliable for event media)."""
+        if not media_item:
+            return False
+
+        source_chat_id = media_item.get('source_chat_id')
+        source_message_id = media_item.get('source_message_id')
+        media_type = media_item.get('type', 'photo')
+        file_id = media_item.get('file_id')
+        caption = media_item.get('caption')
+        file_name = media_item.get('file_name')
+
+        # Format caption with emojis if provided
+        formatted_caption = None
+        if caption:
+            formatted_caption = self.auto_detect_and_convert_message(caption)
+            formatted_caption = self.convert_placeholder_to_premium_emoji(formatted_caption, for_channel=True)
+
+        # Bot API copy (most reliable for event media)
+        if source_chat_id and source_message_id:
+            try:
+                result = await context.bot.copy_message(
+                    chat_id=channel_id,
+                    from_chat_id=source_chat_id,
+                    message_id=source_message_id,
+                    caption=formatted_caption if formatted_caption else None,
+                    parse_mode=ParseMode.HTML if formatted_caption else None
+                )
+                logging.info(f"✅ Copied source media to {channel_id} from {source_chat_id}:{source_message_id}")
+                return result
+            except Exception as e:
+                logging.warning(f"⚠️ copy_message failed for {channel_id}: {e}")
+
+        # If user account fails, download and send
+        if file_id and self.user_app and self.user_client_connected:
+            try:
+                target_id = await self.get_chat_id(str(channel_id).strip())
+                if target_id:
+                    file_stream = await self.download_media_for_user_account(file_id, context)
+                    if file_stream:
+                        if media_type == 'photo':
+                            await self.user_app.send_photo(
+                                chat_id=target_id,
+                                photo=file_stream,
+                                caption=formatted_caption if formatted_caption else None,
+                                parse_mode=PyrogramParseMode.HTML if formatted_caption else None
+                            )
+                        elif media_type == 'video':
+                            await self.user_app.send_video(
+                                chat_id=target_id,
+                                video=file_stream,
+                                caption=formatted_caption if formatted_caption else None,
+                                parse_mode=PyrogramParseMode.HTML if formatted_caption else None
+                            )
+                        elif media_type == 'animation':
+                            await self.user_app.send_animation(
+                                chat_id=target_id,
+                                animation=file_stream,
+                                caption=formatted_caption if formatted_caption else None,
+                                parse_mode=PyrogramParseMode.HTML if formatted_caption else None
+                            )
+                        else:
+                            await self.user_app.send_document(
+                                chat_id=target_id,
+                                document=file_stream,
+                                caption=formatted_caption if formatted_caption else None,
+                                parse_mode=PyrogramParseMode.HTML if formatted_caption else None
+                            )
+                        logging.info(f"✅ Media sent via user account to {channel_id}")
+                        return True
+            except Exception as e:
+                logging.warning(f"⚠️ User account send failed for {channel_id}: {e}")
+
+        logging.error(f"❌ User account not available for: {channel_id}")
+        return False
+
     async def send_media_group(self, context, channel_id, media_items):
-        """Send media group to channel"""
+        """Send media group to channel with stable copy-based delivery."""
         if not media_items:
-            return
+            return False
 
         logging.info(f"📸 Sending {len(media_items)} media items to {channel_id}")
 
-        if len(media_items) > 1:
-            formatted_media_group = []
-            for media_item in media_items:
-                mtype = media_item.get('type', 'photo')
-                fid = media_item.get('file_id')
-                caption = media_item.get('caption')
-                if fid:
-                    # Skip stickers in media groups - send separately
-                    if mtype == 'sticker':
-                        await self.send_message_with_retry(
-                            context=context,
-                            chat_id=channel_id,
-                            for_channel=self.use_user_account,
-                            media_type='sticker',
-                            media_file=fid,
-                            filename_hint=media_item.get('file_name')
-                        )
-                        continue
-                    formatted_media_group.append({
-                        'type': mtype,
-                        'media': fid,
-                        'caption': caption
-                    })
-            
-            if formatted_media_group:
-                await self.send_message_with_retry(
-                    context=context,
-                    chat_id=channel_id,
-                    for_channel=self.use_user_account,
-                    media_group=formatted_media_group
-                )
-        else:
-            media_item = media_items[0]
-            await self.send_message_with_retry(
-                context=context,
-                chat_id=channel_id,
-                for_channel=self.use_user_account,
-                media_type=media_item.get('type', 'photo'),
-                media_file=media_item.get('file_id'),
-                caption=media_item.get('caption'),
-                filename_hint=media_item.get('file_name')
-            )
+        sent_any = False
+        for media_item in media_items:
+            result = await self.send_media_item_stable(context, channel_id, media_item)
+            if result:
+                sent_any = True
+                await asyncio.sleep(0.4)
+            else:
+                logging.error(f"❌ Media item delivery failed for {channel_id}: {media_item.get('type', 'unknown')}")
+
+        return sent_any
 
     async def send_single_prediction(self, context, channel_id, period, prediction):
         """Send prediction message and track message_id"""
+        # Check if channel is in schedule
+        if not self.is_channel_in_schedule(channel_id):
+            logging.info(f"⏸️ Skipping prediction for {channel_id} - outside schedule")
+            return None
+        
+        period = str(period)
         message_text = self.format_single_prediction(channel_id, period, prediction, for_channel=self.use_user_account)
         
         result = await self.send_message_with_retry(
@@ -1598,6 +1777,7 @@ class WinGoBotEnhanced:
         )
         
         if result:
+            self.last_sent_prediction_period = period
             msg_id = self._extract_message_id(result)
             sent_via_user = self.use_user_account and self.user_client_connected
             if msg_id:
@@ -1609,6 +1789,8 @@ class WinGoBotEnhanced:
                     'sent_via_user': sent_via_user
                 }
                 logging.info(f"📝 Stored prediction message_id {msg_id} for period {period} in channel {channel_id} (via_user={sent_via_user})")
+                # Track this prediction (initially pending)
+                await self.track_prediction(context, channel_id, period, result='pending')
         
         return result
 
@@ -1642,8 +1824,8 @@ class WinGoBotEnhanced:
             logging.warning(f"⚠️ Failed to delete message {message_id} in {channel_id}: {e}")
             return False
 
-    async def track_loss_prediction(self, context, channel_id, period):
-        """Track loss prediction and auto-delete old ones (keep only last 3)."""
+    async def track_prediction(self, context, channel_id, period, result='pending'):
+        """Track prediction (win or loss) following user's exact rules."""
         channel_key = str(channel_id)
         period_key = str(period)
 
@@ -1652,60 +1834,91 @@ class WinGoBotEnhanced:
         if not message_info:
             message_info = self.prediction_message_ids.get(channel_key, {}).get(period_key)
         if not message_info:
-            logging.warning(f"⚠️ No message_id found for loss prediction {period_key} in {channel_key}")
+            logging.warning(f"⚠️ No message_id found for prediction {period_key} in {channel_key}")
             return
 
-        # Initialize loss history for channel if needed
-        if channel_key not in self.loss_prediction_history:
-            self.loss_prediction_history[channel_key] = []
+        # Initialize prediction history for channel if needed
+        if channel_key not in self.prediction_history:
+            self.prediction_history[channel_key] = []
 
-        # Avoid duplicate tracking of the same period/message
-        existing = self.loss_prediction_history[channel_key]
-        if any(
-            str(item.get('period')) == period_key or str(item.get('message_id')) == str(message_info['message_id'])
-            for item in existing
-        ):
-            logging.info(f"ℹ️ Loss prediction already tracked for {channel_key}: {period_key} -> {message_info['message_id']}")
-            return
+        existing = self.prediction_history[channel_key]
+        
+        # Update existing prediction if found
+        for item in existing:
+            if str(item.get('period')) == period_key:
+                if result != 'pending':
+                    item['result'] = result
+                    logging.info(f"🔄 Updated prediction result for {channel_key}: {period_key} -> {result}")
+                return
 
-        # Add current loss to history
-        self.loss_prediction_history[channel_key].append({
+        # Add current prediction to history
+        new_prediction = {
             'period': period_key,
             'message_id': message_info['message_id'],
             'sent_via_user': message_info.get('sent_via_user', False),
+            'result': result,
             'timestamp': datetime.now().isoformat()
-        })
+        }
+        existing.append(new_prediction)
+        logging.info(f"📌 Prediction tracked for {channel_key}: {period_key} -> {message_info['message_id']} (result={result}) | total={len(existing)}")
 
-        logging.info(f"📌 Loss prediction tracked for {channel_key}: {period_key} -> {message_info['message_id']} | total={len(self.loss_prediction_history[channel_key])}")
+        # Apply user's rule: when win happens, delete extra old losses before this win
+        try:
+            if result == 'win':
+                # Get all losses before this win
+                win_index = len(existing) - 1  # Index of newly added win
+                losses_before_win = []
+                for i in range(win_index):
+                    if existing[i].get('result') == 'loss':
+                        losses_before_win.append(existing[i])
+                
+                # If more than 2 losses before this win, delete oldest ones
+                if len(losses_before_win) > 2:
+                    losses_to_delete = losses_before_win[:-2]  # All except last 2
+                    for loss_to_delete in losses_to_delete:
+                        logging.info(f"🗑️ Deleting old loss before win for {channel_key}: {loss_to_delete['period']}")
+                        existing.remove(loss_to_delete)
+                        await self.delete_channel_message(
+                            context,
+                            channel_id,
+                            loss_to_delete['message_id'],
+                            loss_to_delete.get('sent_via_user', False)
+                        )
+            
+            # Ensure we have only 3 predictions total (latest)
+            while len(existing) > 3:
+                oldest = existing.pop(0)
+                logging.info(f"🗑️ Deleting oldest prediction for {channel_key}: {oldest['period']} (ID: {oldest['message_id']})")
+                await self.delete_channel_message(
+                    context,
+                    channel_id,
+                    oldest['message_id'],
+                    oldest.get('sent_via_user', False)
+                )
+        except Exception as e:
+            logging.error(f"❌ Error in track_prediction cleanup: {e}")
+            logging.error(f"❌ existing type: {type(existing)}, len: {len(existing) if hasattr(existing, '__len__') else 'N/A'}")
+            if existing:
+                logging.error(f"❌ First item type: {type(existing[0]) if existing else 'N/A'}")
 
-        # Keep only last 3 unique loss predictions - delete oldest if more than 3
-        while len(self.loss_prediction_history[channel_key]) > self.max_loss_predictions_keep:
-            oldest = self.loss_prediction_history[channel_key].pop(0)
-            logging.info(f"🗑️ Deleting old loss prediction for {channel_key}: {oldest['period']} (ID: {oldest['message_id']})")
-            deleted = await self.delete_channel_message(
-                context,
-                channel_id,
-                oldest['message_id'],
-                oldest.get('sent_via_user', False)
-            )
-            if not deleted:
-                logging.warning(f"⚠️ Auto-delete failed for {channel_key}: {oldest['period']} (ID: {oldest['message_id']})")
+    async def track_loss_prediction(self, context, channel_id, period):
+        """Backward compatibility: track loss prediction."""
+        await self.track_prediction(context, channel_id, period, result='loss')
 
     async def clear_loss_history_on_win(self, channel_id):
-        """Clear loss history when a win occurs"""
-        if channel_id in self.loss_prediction_history and self.loss_prediction_history[channel_id]:
-            cleared_count = len(self.loss_prediction_history[channel_id])
-            self.loss_prediction_history[channel_id] = []
-            logging.info(f"🎉 Win detected! Cleared {cleared_count} loss predictions for {channel_id}")
-            return True
+        """Backward compatibility: no longer needed as we keep only last 3 predictions regardless of win/loss."""
         return False
 
-    def reset_loss_prediction_history(self, channel_id=None):
-        """Reset loss prediction history"""
+    def reset_prediction_history(self, channel_id=None):
+        """Reset prediction history (win or loss)"""
         if channel_id is None:
-            self.loss_prediction_history = {}
+            self.prediction_history = {}
         else:
-            self.loss_prediction_history[channel_id] = []
+            self.prediction_history[channel_id] = []
+
+    def reset_loss_prediction_history(self, channel_id=None):
+        """Backward compatibility: reset prediction history"""
+        self.reset_prediction_history(channel_id)
 
     async def send_stored_message(self, context, channel_id, message_data, **placeholders):
         media_items = message_data.get('media_group', [])
@@ -1740,127 +1953,169 @@ class WinGoBotEnhanced:
                     media_item['caption'] = None
 
         if send_order == 'combined' and media_items:
-            # Send media with combined caption (caption attached to first media)
-            if len(media_items) == 1:
-                # Single media with caption — send directly, not as a media group
-                media_item = media_items[0]
-                file_id = media_item.get('file_id')
-                if file_id:
-                    await self.send_message_with_retry(
-                        context=context,
-                        chat_id=channel_id,
-                        for_channel=use_user_account,
-                        media_type=media_item.get('type', 'photo'),
-                        media_file=file_id,
-                        caption=media_item.get('caption') or formatted_text,
-                        filename_hint=media_item.get('file_name')
-                    )
-            else:
-                formatted_media_group = []
-                for i, media_item in enumerate(media_items):
-                    media_type = media_item.get('type', 'photo')
-                    file_id = media_item.get('file_id')
-                    if file_id:
-                        caption = (media_item.get('caption') or formatted_text) if i == 0 else None
-                        formatted_media_group.append({
-                            'type': media_type,
-                            'media': file_id,
-                            'caption': caption,
-                            'file_name': media_item.get('file_name')
-                        })
+            # Send media with caption via user account - download first
+            if self.user_app and self.user_client_connected:
+                target_id = await self.get_chat_id(str(channel_id).strip())
+                if not target_id:
+                    # Try to resolve
+                    try:
+                        chat = await self.user_app.get_chat(str(channel_id).strip())
+                        target_id = chat.id
+                        self.resolved_peers[channel_id] = target_id
+                    except Exception:
+                        # If user account can't resolve, skip user account
+                        logging.warning(f"⚠️ Cannot resolve {channel_id} for user account, will try bot")
+                        target_id = None
                 
-                if formatted_media_group:
-                    await self.send_message_with_retry(
-                        context=context,
-                        chat_id=channel_id,
-                        for_channel=use_user_account,
-                        media_group=formatted_media_group
-                    )
+                if target_id:
+                    for i, media_item in enumerate(media_items):
+                        file_id = media_item.get('file_id')
+                        if file_id:
+                            caption = media_item.get('caption') or (formatted_text if i == 0 else None)
+                            if caption:
+                                caption = self.auto_detect_and_convert_message(caption)
+                                caption = self.convert_placeholder_to_premium_emoji(caption, for_channel=True)
+                            
+                            file_stream = await self.download_media_for_user_account(file_id, context)
+                            if file_stream:
+                                media_type = media_item.get('type', 'photo')
+                                if media_type == 'photo':
+                                    await self.user_app.send_photo(
+                                        chat_id=target_id,
+                                        photo=file_stream,
+                                        caption=caption if caption else None,
+                                        parse_mode=PyrogramParseMode.HTML if caption else None
+                                    )
+                                elif media_type == 'video':
+                                    await self.user_app.send_video(
+                                        chat_id=target_id,
+                                        video=file_stream,
+                                        caption=caption if caption else None,
+                                        parse_mode=PyrogramParseMode.HTML if caption else None
+                                    )
+                                elif media_type == 'animation':
+                                    await self.user_app.send_animation(
+                                        chat_id=target_id,
+                                        animation=file_stream,
+                                        caption=caption if caption else None,
+                                        parse_mode=PyrogramParseMode.HTML if caption else None
+                                    )
+                                else:
+                                    await self.user_app.send_document(
+                                        chat_id=target_id,
+                                        document=file_stream,
+                                        caption=caption if caption else None,
+                                        parse_mode=PyrogramParseMode.HTML if caption else None
+                                    )
+                                logging.info(f"✅ Custom media sent via user account to {channel_id}")
+                                await asyncio.sleep(0.3)
                 
         elif send_order == 'text_first':
-            # Send text first, then media
+            # Send text first, then media via user account - download first
             if formatted_text:
-                await self.send_message_with_retry(
-                    context=context,
+                await self.send_via_user_account(
                     chat_id=channel_id,
                     text=formatted_text,
-                    for_channel=use_user_account
+                    context=context
                 )
             
-            if media_items:
-                if len(media_items) > 1:
-                    formatted_media_group = []
+            if media_items and self.user_app and self.user_client_connected:
+                target_id = await self.get_chat_id(str(channel_id).strip())
+                if target_id:
                     for media_item in media_items:
-                        media_type = media_item.get('type', 'photo')
                         file_id = media_item.get('file_id')
                         if file_id:
-                            formatted_media_group.append({
-                                'type': media_type,
-                                'media': file_id,
-                                'caption': media_item.get('caption'),
-                                'file_name': media_item.get('file_name')
-                            })
-                    
-                    if formatted_media_group:
-                        await self.send_message_with_retry(
-                            context=context,
-                            chat_id=channel_id,
-                            for_channel=use_user_account,
-                            media_group=formatted_media_group
-                        )
-                else:
-                    media_item = media_items[0]
-                    await self.send_message_with_retry(
-                        context=context,
-                        chat_id=channel_id,
-                        for_channel=use_user_account,
-                        media_type=media_item.get('type', 'photo'),
-                        media_file=media_item.get('file_id'),
-                        caption=media_item.get('caption'),
-                        filename_hint=media_item.get('file_name')
-                    )
+                            caption = media_item.get('caption')
+                            if caption:
+                                caption = self.auto_detect_and_convert_message(caption)
+                                caption = self.convert_placeholder_to_premium_emoji(caption, for_channel=True)
+                            
+                            file_stream = await self.download_media_for_user_account(file_id, context)
+                            if file_stream:
+                                media_type = media_item.get('type', 'photo')
+                                if media_type == 'photo':
+                                    await self.user_app.send_photo(
+                                        chat_id=target_id,
+                                        photo=file_stream,
+                                        caption=caption if caption else None,
+                                        parse_mode=PyrogramParseMode.HTML if caption else None
+                                    )
+                                elif media_type == 'video':
+                                    await self.user_app.send_video(
+                                        chat_id=target_id,
+                                        video=file_stream,
+                                        caption=caption if caption else None,
+                                        parse_mode=PyrogramParseMode.HTML if caption else None
+                                    )
+                                elif media_type == 'animation':
+                                    await self.user_app.send_animation(
+                                        chat_id=target_id,
+                                        animation=file_stream,
+                                        caption=caption if caption else None,
+                                        parse_mode=PyrogramParseMode.HTML if caption else None
+                                    )
+                                else:
+                                    await self.user_app.send_document(
+                                        chat_id=target_id,
+                                        document=file_stream,
+                                        caption=caption if caption else None,
+                                        parse_mode=PyrogramParseMode.HTML if caption else None
+                                    )
+                                logging.info(f"✅ Custom media sent via user account to {channel_id}")
+                                await asyncio.sleep(0.3)
                     
         elif send_order == 'media_first':
-            # Send media first, then text
-            if media_items:
-                if len(media_items) > 1:
-                    formatted_media_group = []
+            # Send media first via user account - download first
+            if media_items and self.user_app and self.user_client_connected:
+                target_id = await self.get_chat_id(str(channel_id).strip())
+                if target_id:
                     for media_item in media_items:
-                        media_type = media_item.get('type', 'photo')
                         file_id = media_item.get('file_id')
                         if file_id:
-                            formatted_media_group.append({
-                                'type': media_type,
-                                'media': file_id,
-                                'caption': media_item.get('caption'),
-                                'file_name': media_item.get('file_name')
-                            })
-                    
-                    if formatted_media_group:
-                        await self.send_message_with_retry(
-                            context=context,
-                            chat_id=channel_id,
-                            for_channel=use_user_account,
-                            media_group=formatted_media_group
-                        )
-                else:
-                    media_item = media_items[0]
-                    await self.send_message_with_retry(
-                        context=context,
-                        chat_id=channel_id,
-                        for_channel=use_user_account,
-                        media_type=media_item.get('type', 'photo'),
-                        media_file=media_item.get('file_id'),
-                        caption=media_item.get('caption'),
-                        filename_hint=media_item.get('file_name')
-                    )
+                            caption = media_item.get('caption')
+                            if caption:
+                                caption = self.auto_detect_and_convert_message(caption)
+                                caption = self.convert_placeholder_to_premium_emoji(caption, for_channel=True)
+                            
+                            file_stream = await self.download_media_for_user_account(file_id, context)
+                            if file_stream:
+                                media_type = media_item.get('type', 'photo')
+                                if media_type == 'photo':
+                                    await self.user_app.send_photo(
+                                        chat_id=target_id,
+                                        photo=file_stream,
+                                        caption=caption if caption else None,
+                                        parse_mode=PyrogramParseMode.HTML if caption else None
+                                    )
+                                elif media_type == 'video':
+                                    await self.user_app.send_video(
+                                        chat_id=target_id,
+                                        video=file_stream,
+                                        caption=caption if caption else None,
+                                        parse_mode=PyrogramParseMode.HTML if caption else None
+                                    )
+                                elif media_type == 'animation':
+                                    await self.user_app.send_animation(
+                                        chat_id=target_id,
+                                        animation=file_stream,
+                                        caption=caption if caption else None,
+                                        parse_mode=PyrogramParseMode.HTML if caption else None
+                                    )
+                                else:
+                                    await self.user_app.send_document(
+                                        chat_id=target_id,
+                                        document=file_stream,
+                                        caption=caption if caption else None,
+                                        parse_mode=PyrogramParseMode.HTML if caption else None
+                                    )
+                                logging.info(f"✅ Custom media sent via user account to {channel_id}")
+                                await asyncio.sleep(0.3)
             
             if formatted_text:
-                await self.send_message_with_retry(
-                    context=context,
+                await self.send_via_user_account(
                     chat_id=channel_id,
                     text=formatted_text,
-                    for_channel=use_user_account
+                    context=context
                 )
 
     async def send_session_start_message(self, context, channel_id, hour):
@@ -1942,6 +2197,7 @@ class WinGoBotEnhanced:
         self.loss_prediction_history.clear()
         self.waiting_for_win_before_break.clear()
         self.pending_win_required.clear()
+        self.pending_good_night.clear()
         self.pending_break = False
         self.pending_break_next_session = None
         
@@ -1951,10 +2207,8 @@ class WinGoBotEnhanced:
         success_count = 0
         for channel in self.active_channels:
             try:
-                # Only send if channel should be active today (based on schedule)
-                if self.is_channel_in_schedule(channel):
-                    await self.send_event_message(context, channel, 'good_morning')
-                    success_count += 1
+                await self.send_event_message(context, channel, 'good_morning')
+                success_count += 1
             except Exception as e:
                 logging.error(f"❌ Failed to send morning message to {channel}: {e}")
         
@@ -1975,12 +2229,10 @@ class WinGoBotEnhanced:
                 if not self.is_channel_prediction_active(channel):
                     continue
 
-                # Only send if channel had schedule today
-                if self.is_channel_in_schedule(channel):
-                    await self.send_event_message(
-                        context, channel, 'good_night'
-                    )
-                    success_count += 1
+                await self.send_event_message(
+                    context, channel, 'good_night'
+                )
+                success_count += 1
 
             except Exception as e:
                 logging.error(f"❌ Failed to send night message to {channel}: {e}")
@@ -1989,24 +2241,38 @@ class WinGoBotEnhanced:
 
     # ============= PREDICTION RESULT HANDLING =============
     
-    async def check_result_and_send_next(self, context, data, channels_to_predict=None):
+    async def check_result_and_send_next(self, context, data):
+        """Send next prediction with AI learning"""
         if not self.current_prediction_period or not self.waiting_for_result:
             return False
         
+        # Check if this period already resolved
+        current_target = str(self.current_prediction_period)
+        if current_target in self.resolved_prediction_targets:
+            logging.info(f"⏭️ Period {current_target} already resolved, skipping...")
+            self.waiting_for_result = False
+            return True
+        
         result_found = False
-        result_value = None
-        is_win = False
-        
-        # Use provided channels or fallback to active channels
-        target_channels = channels_to_predict if channels_to_predict else [
-            ch for ch in self.active_channels if self.is_channel_prediction_active(ch)
-        ]
-        
         for item in data[:10]:
             if item['issueNumber'] == self.current_prediction_period:
                 result = item['big_small']
                 is_win = self.current_prediction_choice == result
-                result_value = result
+                
+                period_short = self.current_prediction_period[-2:] if len(self.current_prediction_period) >= 2 else self.current_prediction_period
+                
+                for i, pred in enumerate(self.session_predictions):
+                    if pred.startswith(period_short):
+                        if is_win:
+                            fire_emoji = self.get_emoji('fire', for_channel=True)
+                            if self.current_prediction_choice == 'BIG':
+                                self.session_predictions[i] = f"{period_short} BIGGG {fire_emoji}{fire_emoji}{fire_emoji}{fire_emoji}"
+                            else:
+                                self.session_predictions[i] = f"{period_short} SMALL {fire_emoji}{fire_emoji}{fire_emoji}{fire_emoji}"
+                        else:
+                            choice_text = "BIGGG" if self.current_prediction_choice == 'BIG' else "SMALL"
+                            self.session_predictions[i] = f"{period_short} {choice_text}"
+                        break
                 
                 results = [item['big_small'] for item in data[:20]]
                 numbers = [item['number'] for item in data[:20]]
@@ -2015,6 +2281,20 @@ class WinGoBotEnhanced:
                 if len(result_numeric) >= self.pattern_window_size:
                     pattern_hash = self.calculate_pattern_hash(result_numeric)
                     self.learn_from_pattern(pattern_hash, self.current_prediction_choice, is_win)
+                    self.ai_prediction_history.append({
+                        'prediction': self.current_prediction_choice,
+                        'result': result,
+                        'was_correct': is_win,
+                        'pattern_hash': pattern_hash,
+                        'timestamp': datetime.utcnow()
+                    })
+                    self.mongo.ai_predictions.insert_one({
+                        'prediction': self.current_prediction_choice,
+                        'result': result,
+                        'was_correct': is_win,
+                        'pattern_hash': pattern_hash,
+                        'timestamp': datetime.utcnow()
+                    })
                 
                 if is_win:
                     self.session_wins += 1
@@ -2022,25 +2302,84 @@ class WinGoBotEnhanced:
                     self.consecutive_losses = 0
                     self.last_prediction_was_loss = False
                     self.last_result_was_win = True
+                    logging.info(f"✅ WIN! {self.current_prediction_choice} == {result}")
+                    # Update prediction history for all channels
+                    for channel in self.active_channels:
+                        await self.track_prediction(context, channel, self.current_prediction_period, result='win')
                     
-                    # Clear loss history for all channels on win
-                    for channel in target_channels:
-                        await self.clear_loss_history_on_win(channel)
-                        logging.info(f"🎉 Sending win media to {channel}")
-                        await self.send_event_message(context, channel, 'win')
+                    if hasattr(self, 'last_strategy'):
+                        self.strategy_success_count[self.last_strategy] = self.strategy_success_count.get(self.last_strategy, 0) + 1
+                    
+                    # Send win media to all channels - only if in active session and in schedule
+                    is_active, _, _, _, _ = self.get_current_session_info()
+                    if is_active:
+                        for channel in self.active_channels:
+                            if self.is_channel_prediction_active(channel) and self.is_channel_in_schedule(channel):
+                                await self.send_event_message(context, channel, 'win', 
+                                    prediction=self.current_prediction_choice,
+                                    result=result,
+                                    session=self.current_session)
+                    
+                    # Check if we're waiting for win before break - if so, send break now
+                    if self.pending_break:
+                        for channel in self.active_channels:
+                            if self.waiting_for_win_before_break.get(channel, False):
+                                # Clear waiting flag
+                                self.waiting_for_win_before_break[channel] = False
+                                self.pending_win_required[channel] = False
+                                
+                                # Calculate next session for display
+                                next_session_display = self.pending_break_next_session or "next session"
+                                
+                                # Send break message
+                                await self.send_event_message(
+                                    context, channel, 'break',
+                                    next_session=next_session_display,
+                                    break_duration=60
+                                )
+                                
+                                # Also send break media if available
+                                break_media = self.get_event_media(channel, 'break')
+                                if break_media:
+                                    await self.send_media_group(context, channel, break_media)
+                                
+                                # If this was the last session, send good night
+                                if self.pending_good_night.get(channel, False):
+                                    await self.send_event_message(context, channel, 'good_night')
+                                    self.pending_good_night[channel] = False
+                                    logging.info(f"🌙 Good night message sent to {channel} after last session")
+                                
+                                logging.info(f"⏸️ Break message sent to {channel} after win")
+                        
+                        # Clear pending break flags
+                        self.pending_break = False
+                        self.pending_break_next_session = None
                 else:
                     self.session_losses += 1
                     self.consecutive_losses += 1
                     self.consecutive_wins = 0
                     self.last_prediction_was_loss = True
                     self.last_result_was_win = False
+                    logging.info(f"❌ LOSS! {self.current_prediction_choice} != {result}")
+                    # Update prediction history for all channels
+                    for channel in self.active_channels:
+                        await self.track_prediction(context, channel, self.current_prediction_period, result='loss')
                     
-                    # Track loss prediction for all channels
-                    for channel in target_channels:
-                        await self.track_loss_prediction(context, channel, self.current_prediction_period)
-                        logging.info(f"❌ Sending loss media to {channel}")
-                        await self.send_event_message(context, channel, 'loss')
+                    if hasattr(self, 'last_strategy'):
+                        self.strategy_success_count[self.last_strategy] = max(0, self.strategy_success_count.get(self.last_strategy, 0.5) - 0.1)
+                    
+                    # Send loss media to all channels - only if in active session and in schedule
+                    is_active, _, _, _, _ = self.get_current_session_info()
+                    if is_active:
+                        for channel in self.active_channels:
+                            if self.is_channel_prediction_active(channel) and self.is_channel_in_schedule(channel):
+                                await self.send_event_message(context, channel, 'loss',
+                                    prediction=self.current_prediction_choice,
+                                    result=result,
+                                    session=self.current_session)
                 
+                # Mark this period as resolved
+                self.resolved_prediction_targets.add(current_target)
                 result_found = True
                 break
         
@@ -2049,32 +2388,35 @@ class WinGoBotEnhanced:
             latest_period = latest.get('issueNumber')
             next_period = self.get_next_period(latest_period)
             
-            # If last result was loss, we need to predict again immediately
-            if not is_win:
-                # We need to predict again, don't wait for break
-                choice, confidence = self.analyze_pattern_advanced(data)
-                self.current_prediction_period = next_period
-                self.current_prediction_choice = choice
-                self.waiting_for_result = True
-                
-                for channel in target_channels:
-                    await self.send_single_prediction(context, channel, next_period, choice)
-                return True
-            
-            # Normal flow - get next prediction
             choice, confidence = self.analyze_pattern_advanced(data)
+            
+            period_short = next_period[-2:] if len(next_period) >= 2 else next_period
+            
+            if choice == 'BIG':
+                prediction_line = f"{period_short} BIGGG"
+            else:
+                prediction_line = f"{period_short} SMALL"
+            
+            self.session_predictions.append(prediction_line)
+            
             self.current_prediction_period = next_period
             self.current_prediction_choice = choice
             self.waiting_for_result = True
+            # Don't add next period to resolved yet - wait for its result
             
-            for channel in target_channels:
-                await self.send_single_prediction(context, channel, next_period, choice)
+            logging.info(f"🎯 Next prediction: {choice} (Confidence: {confidence:.1f}%)")
+            logging.info(f"📊 Session stats: {self.session_wins}W {self.session_losses}L (Win rate: {(self.session_wins/(self.session_wins+self.session_losses)*100 if (self.session_wins+self.session_losses) > 0 else 0):.1f}%)")
+            logging.info(f"🤖 AI Accuracy: {self.ai_accuracy:.2%}")
             
+            for channel in self.active_channels:
+                if self.is_channel_prediction_active(channel):
+                    await self.send_single_prediction(context, channel, next_period, choice)
             return True
         
         return False
 
-    async def send_first_prediction(self, context, data, channels_to_predict=None):
+    async def send_first_prediction(self, context, data):
+        """Send first prediction"""
         if self.waiting_for_result:
             return False
         
@@ -2082,404 +2424,38 @@ class WinGoBotEnhanced:
         latest_period = latest.get('issueNumber')
         next_period = self.get_next_period(latest_period)
         
+        # Check if we already sent prediction for this period
+        if next_period in self.resolved_prediction_targets:
+            logging.info(f"⏭️ Prediction already sent for {next_period}, skipping...")
+            # Mark as waiting so we don't keep trying
+            self.current_prediction_period = next_period
+            self.waiting_for_result = True
+            return True
+        
         choice, confidence = self.analyze_pattern_advanced(data)
+        
+        period_short = next_period[-2:] if len(next_period) >= 2 else next_period
+        
+        if choice == 'BIG':
+            prediction_line = f"{period_short} BIGGG"
+        else:
+            prediction_line = f"{period_short} SMALL"
+        
+        self.session_predictions.append(prediction_line)
         
         self.current_prediction_period = next_period
         self.current_prediction_choice = choice
         self.waiting_for_result = True
+        # Don't add to resolved yet - wait for result
         
-        # Use provided channels or fallback to active channels
-        target_channels = channels_to_predict if channels_to_predict else [
-            ch for ch in self.active_channels if self.is_channel_prediction_active(ch)
-        ]
+        logging.info(f"🎯 First prediction: {choice} (Confidence: {confidence:.1f}%)")
+        logging.info(f"🤖 AI Accuracy: {self.ai_accuracy:.2%}")
+        logging.info(f"📊 Starting fresh session")
         
-        for channel in target_channels:
-            await self.send_single_prediction(context, channel, next_period, choice)
-        
+        for channel in self.active_channels:
+            if self.is_channel_prediction_active(channel):
+                await self.send_single_prediction(context, channel, next_period, choice)
         return True
-
-    # ============= CHANNEL MANAGEMENT =============
-    
-    def load_config(self):
-        default_config = {
-            "admin_ids": [6484788124],
-            "channels": [],
-            "channel_configs": {},
-            "channel_prediction_status": {},
-            "channel_subscriptions": {},
-            "custom_break_messages": {},
-            "custom_break_schedules": {},
-            "custom_break_duration": 60,
-            "event_media": {},
-            "api_url": "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json"
-        }
-
-        try:
-            mongo_doc = self._mongo_get_doc('config')
-            if mongo_doc and isinstance(mongo_doc.get('data'), dict):
-                loaded_config = mongo_doc['data']
-                self.config = {**default_config, **loaded_config}
-            elif os.path.exists(self.config_file):
-                with open(self.config_file, 'r', encoding='utf-8') as f:
-                    loaded_config = json.load(f)
-                self.config = {**default_config, **loaded_config}
-                self._mongo_upsert_doc('config', loaded_config)
-                logging.info("✅ Config migrated from JSON to MongoDB")
-            else:
-                self.config = default_config.copy()
-                self.active_channels = []
-                self.channel_configs = {}
-                self.channel_prediction_status = {}
-                self.channel_subscriptions = {}
-                self.custom_break_messages = {}
-                self.custom_break_schedules = {}
-                self.event_media = {}
-                self.save_config()
-                logging.info("✅ Created new config in MongoDB")
-                return
-
-            self.active_channels = self.config.get('channels', [])
-            self.channel_configs = self.config.get('channel_configs', {})
-            self.channel_prediction_status = self.config.get('channel_prediction_status', {})
-            self.channel_subscriptions = self.config.get('channel_subscriptions', {})
-            self.custom_break_messages = self.config.get('custom_break_messages', {})
-            self.custom_break_schedules = self.config.get('custom_break_schedules', {})
-            self.custom_break_duration = self.config.get('custom_break_duration', 60)
-            self.event_media = self.config.get('event_media', {})
-
-            for channel_id, config in self.channel_configs.items():
-                if 'templates' not in config or not isinstance(config.get('templates'), dict):
-                    config['templates'] = {}
-                for t_key, t_val in self.default_templates.items():
-                    if t_key not in config['templates']:
-                        config['templates'][t_key] = t_val
-
-                if 'show_links' not in config:
-                    config['show_links'] = True
-                if 'show_promo' not in config:
-                    config['show_promo'] = True
-                if channel_id not in self.channel_prediction_status:
-                    self.channel_prediction_status[channel_id] = True
-
-            logging.info(f"✅ Configuration loaded. Active channels: {len(self.active_channels)}")
-
-        except Exception as e:
-            logging.error(f"❌ Error loading config: {e}")
-            self.config = default_config.copy()
-            self.active_channels = []
-            self.channel_configs = {}
-            self.channel_prediction_status = {}
-            self.channel_subscriptions = {}
-            self.custom_break_messages = {}
-            self.custom_break_schedules = {}
-            self.event_media = {}
-            self.save_config()
-
-    def save_config(self):
-        try:
-            self.config['channels'] = self.active_channels
-            self.config['channel_configs'] = self.channel_configs
-            self.config['channel_prediction_status'] = self.channel_prediction_status
-            self.config['channel_subscriptions'] = self.channel_subscriptions
-            self.config['custom_break_messages'] = self.custom_break_messages
-            self.config['custom_break_schedules'] = self.custom_break_schedules
-            self.config['custom_break_duration'] = self.custom_break_duration
-            self.config['event_media'] = self.event_media
-
-            if self._mongo_upsert_doc('config', self.config):
-                logging.info(f"✅ Configuration saved to MongoDB")
-        except Exception as e:
-            logging.error(f"❌ Error saving config: {e}")
-
-    def get_channel_config(self, channel_id):
-        if channel_id not in self.channel_configs:
-            self.channel_configs[channel_id] = {
-                'register_link': "https://bdgsg.com//#/register?invitationCode=5151329947",
-                'promotional_text': "{gift} Register now and get DAILY FREE GIFT CODE! {gift}",
-                'show_links': True,
-                'show_promo': True,
-                'templates': self.default_templates.copy(),
-                'custom_break_enabled': False,
-                'custom_break_delay': 5,
-                'custom_break_mode': 'sequential',
-                'prediction_start_hour': 6,
-                'prediction_end_hour': 24,
-                'custom_schedule': []  # List of time slots like ["10:00-11:00", "14:00-15:00"]
-            }
-            self.save_config()
-        
-        config = self.channel_configs[channel_id]
-        if 'show_links' not in config:
-            config['show_links'] = True
-        if 'show_promo' not in config:
-            config['show_promo'] = True
-        if 'templates' not in config:
-            config['templates'] = self.default_templates.copy()
-            self.save_config()
-        
-        return config
-
-    def update_channel_config(self, channel_id, updates):
-        config = self.get_channel_config(channel_id)
-        config.update(updates)
-        self.channel_configs[channel_id] = config
-        self.save_config()
-        return config
-
-    def get_channel_template(self, channel_id, template_key):
-        config = self.get_channel_config(channel_id)
-        return config['templates'].get(template_key, self.default_templates[template_key] if template_key in self.default_templates else '')
-
-    def is_channel_prediction_active(self, channel_id):
-        return self.channel_prediction_status.get(channel_id, True)
-    
-    def is_channel_in_schedule(self, channel_id, check_time=None):
-        """Check if current time is within channel's custom schedule"""
-        if check_time is None:
-            check_time = self.get_ist_now()
-        
-        channel_config = self.get_channel_config(channel_id)
-        custom_schedule = channel_config.get('custom_schedule', [])
-        
-        # If no custom schedule, use global schedule
-        if not custom_schedule:
-            current_hour = check_time.hour
-            current_minute = check_time.minute
-            current_time_minutes = current_hour * 60 + current_minute
-            day_start = self.prediction_start_hour * 60
-            day_end = self.prediction_end_hour * 60
-            return day_start <= current_time_minutes < day_end
-        
-        # Check against custom schedule slots
-        current_minutes = check_time.hour * 60 + check_time.minute
-        
-        for slot in custom_schedule:
-            try:
-                start_str, end_str = slot.split('-')
-                start_hour, start_min = map(int, start_str.split(':'))
-                end_hour, end_min = map(int, end_str.split(':'))
-                
-                start_minutes = start_hour * 60 + start_min
-                end_minutes = end_hour * 60 + end_min
-                
-                if start_minutes <= current_minutes < end_minutes:
-                    return True
-            except:
-                continue
-        
-        return False
-    
-    def get_channel_schedule_status(self, channel_id):
-        """Get detailed schedule status for a channel"""
-        channel_config = self.get_channel_config(channel_id)
-        custom_schedule = channel_config.get('custom_schedule', [])
-        
-        if not custom_schedule:
-            return {
-                'type': 'global',
-                'slots': [],
-                'next_session': None,
-                'is_active': self.is_channel_in_schedule(channel_id)
-            }
-        
-        now = self.get_ist_now()
-        current_minutes = now.hour * 60 + now.minute
-        
-        active_slot = None
-        next_slot = None
-        min_next_diff = float('inf')
-        
-        for slot in custom_schedule:
-            try:
-                start_str, end_str = slot.split('-')
-                start_hour, start_min = map(int, start_str.split(':'))
-                end_hour, end_min = map(int, end_str.split(':'))
-                
-                start_minutes = start_hour * 60 + start_min
-                end_minutes = end_hour * 60 + end_min
-                
-                if start_minutes <= current_minutes < end_minutes:
-                    active_slot = slot
-                
-                # Find next upcoming slot
-                if current_minutes < start_minutes:
-                    diff = start_minutes - current_minutes
-                    if diff < min_next_diff:
-                        min_next_diff = diff
-                        next_slot = slot
-            except:
-                continue
-        
-        return {
-            'type': 'custom',
-            'slots': custom_schedule,
-            'active_slot': active_slot,
-            'next_slot': next_slot,
-            'is_active': active_slot is not None
-        }
-
-    def toggle_channel_prediction(self, channel_id):
-        current = self.channel_prediction_status.get(channel_id, True)
-        self.channel_prediction_status[channel_id] = not current
-        self.save_config()
-        return self.channel_prediction_status[channel_id]
-
-    def set_channel_prediction_status(self, channel_id, status):
-        self.channel_prediction_status[channel_id] = status
-        self.save_config()
-        return status
-
-    def is_channel_enabled(self, channel_id):
-        return self.is_channel_prediction_active(channel_id)
-
-    def set_channel_subscription_days(self, channel_id, days):
-        now = self.get_ist_now()
-        expires = now + timedelta(days=max(1, int(days)))
-        self.channel_subscriptions[channel_id] = {
-            'days': int(days),
-            'expires_at': expires.isoformat(),
-            'alert_1d_sent': False,
-            'expired_sent': False,
-        }
-        self.save_config()
-        return self.channel_subscriptions[channel_id]
-    
-    # ============= CUSTOM SCHEDULE METHODS =============
-    
-    def validate_time_slot(self, slot_str):
-        """Validate time slot format HH:MM-HH:MM"""
-        try:
-            if '-' not in slot_str:
-                return False, "Invalid format. Use HH:MM-HH:MM"
-            
-            start_str, end_str = slot_str.split('-')
-            
-            start_parts = start_str.strip().split(':')
-            end_parts = end_str.strip().split(':')
-            
-            if len(start_parts) != 2 or len(end_parts) != 2:
-                return False, "Invalid time format. Use HH:MM"
-            
-            start_hour, start_min = int(start_parts[0]), int(start_parts[1])
-            end_hour, end_min = int(end_parts[0]), int(end_parts[1])
-            
-            if not (0 <= start_hour <= 23 and 0 <= start_min <= 59):
-                return False, "Invalid start time"
-            
-            if not (0 <= end_hour <= 23 and 0 <= end_min <= 59):
-                return False, "Invalid end time"
-            
-            start_minutes = start_hour * 60 + start_min
-            end_minutes = end_hour * 60 + end_min
-            
-            if start_minutes >= end_minutes:
-                return False, "Start time must be before end time"
-            
-            return True, f"{start_hour:02d}:{start_min:02d}-{end_hour:02d}:{end_min:02d}"
-            
-        except ValueError:
-            return False, "Invalid numbers in time slot"
-        except Exception as e:
-            return False, f"Error: {str(e)}"
-    
-    def add_schedule_slot(self, channel_id, slot_str):
-        """Add a new schedule slot to channel"""
-        valid, result = self.validate_time_slot(slot_str)
-        if not valid:
-            return False, result
-        
-        channel_config = self.get_channel_config(channel_id)
-        custom_schedule = channel_config.get('custom_schedule', [])
-        
-        # Check for overlapping slots
-        new_slot = result
-        new_start, new_end = new_slot.split('-')
-        new_start_min = int(new_start.split(':')[0]) * 60 + int(new_start.split(':')[1])
-        new_end_min = int(new_end.split(':')[0]) * 60 + int(new_end.split(':')[1])
-        
-        for existing_slot in custom_schedule:
-            ex_start, ex_end = existing_slot.split('-')
-            ex_start_min = int(ex_start.split(':')[0]) * 60 + int(ex_start.split(':')[1])
-            ex_end_min = int(ex_end.split(':')[0]) * 60 + int(ex_end.split(':')[1])
-            
-            # Check overlap
-            if not (new_end_min <= ex_start_min or new_start_min >= ex_end_min):
-                return False, f"Overlaps with existing slot: {existing_slot}"
-        
-        custom_schedule.append(new_slot)
-        # Sort by start time
-        custom_schedule.sort(key=lambda x: int(x.split('-')[0].replace(':', '')))
-        
-        channel_config['custom_schedule'] = custom_schedule
-        self.update_channel_config(channel_id, channel_config)
-        
-        return True, f"Added: {new_slot}"
-    
-    def remove_schedule_slot(self, channel_id, index):
-        """Remove a schedule slot by index"""
-        channel_config = self.get_channel_config(channel_id)
-        custom_schedule = channel_config.get('custom_schedule', [])
-        
-        if 0 <= index < len(custom_schedule):
-            removed = custom_schedule.pop(index)
-            channel_config['custom_schedule'] = custom_schedule
-            self.update_channel_config(channel_id, channel_config)
-            return True, f"Removed: {removed}"
-        
-        return False, "Invalid slot index"
-    
-    def clear_all_schedule_slots(self, channel_id):
-        """Clear all custom schedule slots for a channel"""
-        channel_config = self.get_channel_config(channel_id)
-        channel_config['custom_schedule'] = []
-        self.update_channel_config(channel_id, channel_config)
-        return True, "All schedule slots cleared. Using global schedule."
-
-    def is_channel_subscription_active(self, channel_id):
-        sub = self.channel_subscriptions.get(channel_id)
-        if not sub:
-            return True
-        try:
-            exp = datetime.fromisoformat(sub.get('expires_at'))
-            return self.get_ist_now() < exp
-        except Exception:
-            return True
-
-    # ============= CUSTOM MESSAGES MANAGEMENT =============
-    
-    def get_custom_messages(self, channel_id, message_type):
-        channel_key = str(channel_id)
-        if channel_key not in self.custom_messages:
-            return []
-        return self.custom_messages[channel_key].get(message_type, [])
-
-    def add_custom_message_simple(self, channel_id, message_type, message_data):
-        channel_key = str(channel_id)
-        if channel_key not in self.custom_messages:
-            self.custom_messages[channel_key] = {}
-        if message_type not in self.custom_messages[channel_key]:
-            self.custom_messages[channel_key][message_type] = []
-        
-        self.custom_messages[channel_key][message_type].append(message_data)
-        self.save_custom_messages()
-        return len(self.custom_messages[channel_key][message_type]) - 1
-
-    def delete_custom_message(self, channel_id, message_type, index=None):
-        channel_key = str(channel_id)
-        if channel_key not in self.custom_messages or message_type not in self.custom_messages[channel_key]:
-            return False
-        
-        if index is None:
-            del self.custom_messages[channel_key][message_type]
-            self.save_custom_messages()
-            return True
-        elif 0 <= index < len(self.custom_messages[channel_key][message_type]):
-            self.custom_messages[channel_key][message_type].pop(index)
-            if not self.custom_messages[channel_key][message_type]:
-                del self.custom_messages[channel_key][message_type]
-            self.save_custom_messages()
-            return True
-        return False
 
     def save_custom_messages(self):
         try:
@@ -2806,19 +2782,18 @@ class WinGoBotEnhanced:
         
         try:
             # First convert placeholders to premium emojis if using user account
-            if for_channel and self.use_user_account and self.user_client_connected:
+            if for_channel and self.use_user_account:
                 for placeholder, premium_emoji in self.emoji_config.get('premium_emojis', {}).items():
                     placeholder_format = f"{{{placeholder}}}"
                     if placeholder_format in text:
                         text = text.replace(placeholder_format, premium_emoji)
             else:
-                # Use regular emojis (fallback or when user account not available)
+                # Use regular emojis
                 for placeholder, emoji in self.emoji_config.get('placeholder_to_emoji', {}).items():
-                    placeholder_format = f"{{{placeholder}}}"
-                    if placeholder_format in text:
-                        text = text.replace(placeholder_format, emoji)
+                    if placeholder in text:
+                        text = text.replace(placeholder, emoji)
             
-            # Also handle any remaining placeholders without braces
+            # Also handle any remaining placeholders
             for placeholder, emoji in self.emoji_config.get('placeholder_to_emoji', {}).items():
                 if placeholder in text:
                     text = text.replace(placeholder, emoji)
@@ -2838,27 +2813,9 @@ class WinGoBotEnhanced:
         
         try:
             converted_text = message_text
-            
-            # First, convert any existing premium emoji tags to placeholders
-            # Pattern: <emoji id=XXXXX>emoji</emoji>
-            import re
-            premium_pattern = r'<emoji id=\d+>(.*?)</emoji>'
-            
-            def premium_to_placeholder(match):
-                emoji_char = match.group(1)
-                # Check if this emoji has a placeholder
-                for emoji, placeholder in self.emoji_config.get('emoji_to_placeholder', {}).items():
-                    if emoji_char == emoji:
-                        return placeholder
-                return emoji_char  # Return original if no placeholder found
-            
-            converted_text = re.sub(premium_pattern, premium_to_placeholder, converted_text)
-            
-            # Then convert regular emojis to placeholders
             for emoji, placeholder in self.emoji_config.get('emoji_to_placeholder', {}).items():
                 if emoji in converted_text:
                     converted_text = converted_text.replace(emoji, placeholder)
-            
             return converted_text
         except Exception as e:
             logging.error(f"❌ Error in auto-detect and convert: {e}")
@@ -2870,14 +2827,10 @@ class WinGoBotEnhanced:
             return text
         
         try:
-            # First convert any emojis to placeholders for consistent storage
+            # First convert any emojis to placeholders for storage format
             text = self.auto_detect_and_convert_message(text)
-            
-            # Check if user account is available for premium emojis
-            use_premium = self.use_user_account and self.user_client_connected
-            
             # Then convert placeholders to actual emojis (premium if available)
-            return self.convert_placeholder_to_premium_emoji(text, for_channel=use_premium)
+            return self.convert_placeholder_to_premium_emoji(text, for_channel=True)
         except Exception as e:
             logging.error(f"❌ Error formatting custom message: {e}")
             return text
@@ -2950,6 +2903,261 @@ class WinGoBotEnhanced:
                     self.emoji_config[key] = {}
         
         self.save_emoji_config()
+
+    def load_config(self):
+        """Load configuration from MongoDB"""
+        default_config = {
+            "admin_ids": [6484788124],
+            "channels": [],
+            "channel_configs": {},
+            "channel_prediction_status": {},
+            "channel_subscriptions": {},
+            "custom_break_messages": {},
+            "custom_break_schedules": {},
+            "custom_break_duration": 60,
+            "event_media": {},
+            "api_url": "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json",
+            "channel_schedules": {}  # Custom schedule per channel: {"@channel": [{"start": "10:00", "end": "11:00"}, ...]}
+        }
+
+        try:
+            mongo_doc = self._mongo_get_doc('config')
+            if mongo_doc and isinstance(mongo_doc.get('data'), dict):
+                loaded_config = mongo_doc['data']
+                self.config = {**default_config, **loaded_config}
+            elif os.path.exists(self.config_file):
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    loaded_config = json.load(f)
+                self.config = {**default_config, **loaded_config}
+                self._mongo_upsert_doc('config', loaded_config)
+                logging.info("✅ Config migrated from JSON to MongoDB")
+            else:
+                self.config = default_config.copy()
+                self.active_channels = []
+                self.channel_configs = {}
+                self.channel_prediction_status = {}
+                self.channel_subscriptions = {}
+                self.custom_break_messages = {}
+                self.custom_break_schedules = {}
+                self.event_media = {}
+                self.save_config()
+                logging.info("✅ Created new config in MongoDB")
+                return
+
+            self.active_channels = self.config.get('channels', [])
+            self.channel_configs = self.config.get('channel_configs', {})
+            self.channel_prediction_status = self.config.get('channel_prediction_status', {})
+            self.channel_subscriptions = self.config.get('channel_subscriptions', {})
+            self.custom_break_messages = self.config.get('custom_break_messages', {})
+            self.custom_break_schedules = self.config.get('custom_break_schedules', {})
+            self.custom_break_duration = self.config.get('custom_break_duration', 60)
+            self.event_media = self.config.get('event_media', {})
+            self.channel_schedules = self.config.get('channel_schedules', {})
+
+            for channel_id, config in self.channel_configs.items():
+                if 'templates' not in config or not isinstance(config.get('templates'), dict):
+                    config['templates'] = {}
+                for t_key, t_val in self.default_templates.items():
+                    if t_key not in config['templates']:
+                        config['templates'][t_key] = t_val
+
+                if 'show_links' not in config:
+                    config['show_links'] = True
+                if 'show_promo' not in config:
+                    config['show_promo'] = True
+                if channel_id not in self.channel_prediction_status:
+                    self.channel_prediction_status[channel_id] = True
+
+            logging.info(f"✅ Configuration loaded. Active channels: {len(self.active_channels)}")
+
+        except Exception as e:
+            logging.error(f"❌ Error loading config: {e}")
+            self.config = default_config.copy()
+            self.active_channels = []
+            self.channel_configs = {}
+            self.channel_prediction_status = {}
+            self.channel_subscriptions = {}
+            self.custom_break_messages = {}
+            self.custom_break_schedules = {}
+            self.event_media = {}
+            self.save_config()
+
+    def save_config(self):
+        """Save configuration to MongoDB"""
+        try:
+            self.config['channels'] = self.active_channels
+            self.config['channel_configs'] = self.channel_configs
+            self.config['channel_prediction_status'] = self.channel_prediction_status
+            self.config['channel_subscriptions'] = self.channel_subscriptions
+            self.config['custom_break_messages'] = self.custom_break_messages
+            self.config['custom_break_schedules'] = self.custom_break_schedules
+            self.config['custom_break_duration'] = self.custom_break_duration
+            self.config['event_media'] = self.event_media
+            self.config['channel_schedules'] = self.channel_schedules
+
+            if self._mongo_upsert_doc('config', self.config):
+                logging.info(f"✅ Configuration saved to MongoDB")
+        except Exception as e:
+            logging.error(f"❌ Error saving config: {e}")
+
+    def is_channel_prediction_active(self, channel_id):
+        """Check if predictions are active for a channel"""
+        return self.channel_prediction_status.get(channel_id, True)
+
+    def set_channel_prediction_status(self, channel_id, status):
+        """Set prediction status for a channel"""
+        self.channel_prediction_status[channel_id] = status
+        self.save_config()
+        logging.info(f"✅ Prediction status for {channel_id}: {'Active' if status else 'Paused'}")
+        return status
+
+    def toggle_channel_prediction(self, channel_id):
+        """Toggle prediction status for a channel"""
+        current = self.channel_prediction_status.get(channel_id, True)
+        new_status = not current
+        self.channel_prediction_status[channel_id] = new_status
+        self.save_config()
+        logging.info(f"✅ Prediction toggled for {channel_id}: {'Active' if new_status else 'Paused'}")
+        return new_status
+
+    def is_channel_in_schedule(self, channel_id):
+        """Check if current time is within channel's custom schedule"""
+        schedule = self.channel_schedules.get(channel_id, [])
+        
+        # If no schedule set, always active (default behavior)
+        if not schedule:
+            return True
+        
+        now = self.get_ist_now()
+        current_time = now.hour * 60 + now.minute  # Minutes since midnight
+        
+        for slot in schedule:
+            start_str = slot.get('start', '')
+            end_str = slot.get('end', '')
+            
+            if not start_str or not end_str:
+                continue
+            
+            try:
+                start_hour, start_min = map(int, start_str.split(':'))
+                end_hour, end_min = map(int, end_str.split(':'))
+                
+                start_minutes = start_hour * 60 + start_min
+                end_minutes = end_hour * 60 + end_min
+                
+                if start_minutes <= current_time < end_minutes:
+                    return True
+            except Exception:
+                continue
+        
+        return False
+
+    def get_channel_schedule_status(self, channel_id):
+        """Get current schedule slot info for a channel"""
+        schedule = self.channel_schedules.get(channel_id, [])
+        
+        if not schedule:
+            return None, None
+        
+        now = self.get_ist_now()
+        current_time = now.hour * 60 + now.minute
+        
+        for slot in schedule:
+            start_str = slot.get('start', '')
+            end_str = slot.get('end', '')
+            
+            if not start_str or not end_str:
+                continue
+            
+            try:
+                start_hour, start_min = map(int, start_str.split(':'))
+                end_hour, end_min = map(int, end_str.split(':'))
+                
+                start_minutes = start_hour * 60 + start_min
+                end_minutes = end_hour * 60 + end_min
+                
+                if start_minutes <= current_time < end_minutes:
+                    return start_str, end_str
+            except Exception:
+                continue
+        
+        return None, None
+
+    def get_channel_config(self, channel_id):
+        """Get channel-specific config or create default"""
+        if channel_id not in self.channel_configs:
+            self.channel_configs[channel_id] = {
+                'register_link': "https://bdgsg.com//#/register?invitationCode=5151329947",
+                'promotional_text': "{gift} Register now and get DAILY FREE GIFT CODE! {gift}",
+                'show_links': True,
+                'show_promo': True,
+                'templates': self.default_templates.copy(),
+                'custom_break_enabled': False,
+                'send_win_loss_text': True,  # Win/loss text message on/off
+            }
+            self.save_config()
+        
+        config = self.channel_configs[channel_id]
+        if 'templates' not in config or not isinstance(config.get('templates'), dict):
+            config['templates'] = {}
+        for t_key, t_val in self.default_templates.items():
+            if t_key not in config['templates']:
+                config['templates'][t_key] = t_val
+        
+        # Ensure send_win_loss_text exists
+        if 'send_win_loss_text' not in config:
+            config['send_win_loss_text'] = True
+        
+        return config
+
+    def update_channel_config(self, channel_id, updates):
+        """Update channel-specific config"""
+        config = self.get_channel_config(channel_id)
+        config.update(updates)
+        if channel_id not in self.channel_configs:
+            self.channel_configs[channel_id] = config
+        self.save_config()
+        logging.info(f"✅ Channel config updated for {channel_id}: {list(updates.keys())}")
+
+    def get_channel_template(self, channel_id, template_key):
+        """Get template for a channel"""
+        config = self.get_channel_config(channel_id)
+        templates = config.get('templates', {})
+        return templates.get(template_key, self.default_templates.get(template_key, ""))
+
+    def get_custom_messages(self, channel_id, event_type):
+        """Get custom messages for a channel and event type"""
+        if channel_id not in self.custom_messages:
+            return []
+        return self.custom_messages[channel_id].get(event_type, [])
+
+    def add_custom_message_simple(self, channel_id, message_type, message_data):
+        """Add custom message for a channel"""
+        if channel_id not in self.custom_messages:
+            self.custom_messages[channel_id] = {}
+        if message_type not in self.custom_messages[channel_id]:
+            self.custom_messages[channel_id][message_type] = []
+        
+        self.custom_messages[channel_id][message_type].append(message_data)
+        self.save_custom_messages()
+        
+        return len(self.custom_messages[channel_id][message_type]) - 1
+
+    def delete_custom_message(self, channel_id, message_type, index):
+        """Delete custom message by index"""
+        if channel_id not in self.custom_messages:
+            return False
+        if message_type not in self.custom_messages[channel_id]:
+            return False
+        
+        messages = self.custom_messages[channel_id][message_type]
+        if 0 <= index < len(messages):
+            messages.pop(index)
+            if not messages:
+                del self.custom_messages[channel_id][message_type]
+            self.save_custom_messages()
+            return True
+        return False
 
     def initialize_configs(self):
         self.load_emoji_config()
@@ -3057,6 +3265,22 @@ class WinGoBotEnhanced:
             logging.error(f"❌ Failed to reconnect user client: {e}")
             self.user_client_connected = False
 
+    def normalize_schedule_slot(self, slot):
+        """Accept both {'start','end'} dicts and 'HH:MM-HH:MM' strings."""
+        if isinstance(slot, dict):
+            start = slot.get('start')
+            end = slot.get('end')
+            if start and end:
+                return {'start': str(start).strip(), 'end': str(end).strip()}
+            return None
+        if isinstance(slot, str) and '-' in slot:
+            start, end = slot.split('-', 1)
+            start = start.strip()
+            end = end.strip()
+            if start and end:
+                return {'start': start, 'end': end}
+        return None
+
     async def resolve_all_channels(self):
         if not self.user_app or not self.active_channels:
             return
@@ -3084,6 +3308,8 @@ class WinGoBotEnhanced:
                         self.username_to_id[channel_str] = chat.id
                         self.id_to_username[str(chat.id)] = channel_str
                         self.resolved_channels.add(chat.id)
+                        self.resolved_peers[channel_str] = chat.id
+                        self.resolved_peers[str(chat.id)] = chat.id
                         logging.info(f"✅ Resolved {channel_str} -> {chat.id}")
                     
                     elif channel_str.lstrip('-').isdigit():
@@ -3092,13 +3318,26 @@ class WinGoBotEnhanced:
                         self.username_to_id[channel_str] = chat_id
                         self.id_to_username[str(chat_id)] = channel_str
                         self.resolved_channels.add(chat_id)
+                        self.resolved_peers[channel_str] = chat_id
+                        self.resolved_peers[str(chat_id)] = chat_id
                         logging.info(f"✅ Resolved {channel_str} -> {chat_id}")
                     
                     else:
                         logging.warning(f"⚠️ Invalid channel format: {channel_str}")
                         self.failed_channels.add(channel_str)
                         
-                except (PeerIdInvalid, ChannelInvalid, ChannelPrivate, UserNotParticipant) as e:
+                except UserNotParticipant as e:
+                    # User not in channel, but we can still use the username/id for bot API
+                    logging.warning(f"⚠️ User not in {channel_str}, will use for bot API")
+                    # Store as resolved for bot API fallback
+                    if channel_str.startswith('@'):
+                        # Try to get channel info anyway
+                        self.failed_channels.add(channel_str)
+                    elif channel_str.lstrip('-').isdigit():
+                        chat_id = int(channel_str)
+                        self.resolved_peers[channel_str] = chat_id
+                        self.resolved_peers[str(chat_id)] = chat_id
+                except (PeerIdInvalid, ChannelInvalid, ChannelPrivate) as e:
                     logging.error(f"❌ Cannot access channel {channel_str}: {e}")
                     self.failed_channels.add(channel_str)
                 except FloodWait as e:
@@ -3222,8 +3461,8 @@ class WinGoBotEnhanced:
                 
                 is_active, session_start, session_end, next_session, minutes_until = self.get_current_session_info()
                 
-                # Count loss messages currently tracked
-                total_loss_tracked = sum(len(history) for history in self.loss_prediction_history.values())
+                # Count prediction messages currently tracked (win or loss)
+                total_predictions_tracked = sum(len(history) for history in self.prediction_history.values())
                 
                 stats_text = f"""📊 Bot Statistics & AI Analysis
 
@@ -3241,8 +3480,8 @@ class WinGoBotEnhanced:
 • Consecutive Losses: {self.consecutive_losses}
 
 🔄 AUTO-DELETE STATUS:
-• Loss Messages Tracked: {total_loss_tracked}
-• Max Keep Per Channel: {self.max_loss_predictions_keep}
+• Predictions Tracked (Win/Loss): {total_predictions_tracked}
+• Max Keep Per Channel: {self.max_predictions_keep}
 
 ⏰ SCHEDULE STATUS:
 • Current Status: {'🟢 ACTIVE' if is_active else '⏸️ BREAK'}
@@ -3791,21 +4030,15 @@ Would you like to test send this message?"""
                     reply_markup=self.get_keyboard('prediction_control')
                 )
                 
-            elif data.startswith('toggle_channel_prediction:') or data.startswith('toggle_single_channel_prediction:'):
+            elif data.startswith('toggle_channel_prediction:'):
                 channel_id = data.split(':', 1)[1]
                 new_status = self.toggle_channel_prediction(channel_id)
                 status_text = "🟢 ACTIVATED" if new_status else "⏸️ PAUSED"
                 
-                if data.startswith('toggle_single_channel_prediction:'):
-                    await query.edit_message_text(
-                        f"✅ Predictions {status_text} for {channel_id}",
-                        reply_markup=self.get_keyboard('channel_config', channel_id)
-                    )
-                else:
-                    await query.edit_message_text(
-                        f"✅ Predictions {status_text} for {channel_id}",
-                        reply_markup=self.get_keyboard('prediction_control')
-                    )
+                await query.edit_message_text(
+                    f"✅ Predictions {status_text} for {channel_id}",
+                    reply_markup=self.get_keyboard('prediction_control')
+                )
                 
             elif data == 'start_all_predictions':
                 for channel_id in self.active_channels:
@@ -3831,10 +4064,7 @@ Would you like to test send this message?"""
                 channel_status = self.is_channel_prediction_active(channel_id)
                 status_text = "🟢 ACTIVE" if channel_status else "⏸️ PAUSED"
                 
-                # Get per-channel schedule status
-                schedule_status = self.get_channel_schedule_status(channel_id)
-                schedule_active = schedule_status['is_active']
-                schedule_type = "Custom" if schedule_status['type'] == 'custom' else "Global"
+                is_active, session_start, session_end, next_session, _ = self.get_current_session_info()
                 
                 config_text = f"""⚙️ Configuration for {channel_id}
 
@@ -3842,11 +4072,9 @@ Would you like to test send this message?"""
 
 Prediction Status: {status_text}
 Current Time: {self.get_ist_now().strftime('%I:%M %p')}
-Schedule Type: {schedule_type}
-Schedule Status: {'🟢 ACTIVE' if schedule_active else '⏸️ BREAK'}
-{('Active Slot: ' + schedule_status['active_slot']) if schedule_status.get('active_slot') else ''}
-{('Next Slot: ' + schedule_status['next_slot']) if schedule_status.get('next_slot') else ''}
-Custom Slots: {len(schedule_status['slots'])}
+Session Status: {'🟢 ACTIVE' if is_active else '⏸️ BREAK'}
+{('Active Until: ' + session_end) if session_end else ''}
+Next Session: {next_session}
 
 Select what to configure:"""
                 
@@ -3864,27 +4092,6 @@ Select what to configure:"""
 Select what to change:"""
                 
                 await query.edit_message_text(links_text, reply_markup=self.get_keyboard('links_setup', channel_id))
-                
-            elif data.startswith('schedule_setup:'):
-                channel_id = data.split(':', 1)[1]
-                schedule_status = self.get_channel_schedule_status(channel_id)
-                
-                if schedule_status['slots']:
-                    slots_text = "\n".join([f"  {i+1}. {slot}" for i, slot in enumerate(schedule_status['slots'])])
-                else:
-                    slots_text = "  (Using global schedule: 06:00-00:00)"
-                
-                schedule_text = f"""⏰ Schedule Setup for {channel_id}
-
-Current Schedule:
-{slots_text}
-
-Format: HH:MM-HH:MM (24-hour)
-Example: 10:00-11:00, 14:00-15:00
-
-Select an action:"""
-                
-                await query.edit_message_text(schedule_text, reply_markup=self.get_keyboard('schedule_setup', channel_id))
                 
             elif data.startswith('toggle_links:'):
                 channel_id = data.split(':', 1)[1]
@@ -3918,74 +4125,6 @@ Select an action:"""
                 await query.edit_message_text(
                     f"📢 Change Promo Text for {channel_id}\n\nSend the new promotional text:",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data=f"links_setup:{channel_id}")]])
-                )
-                
-            elif data.startswith('add_schedule_slot:'):
-                channel_id = data.split(':', 1)[1]
-                self.user_state[chat_id] = f'awaiting_schedule_slot:{channel_id}'
-                await query.edit_message_text(
-                    f"➕ Add Schedule Slot for {channel_id}\n\n"
-                    f"Send time slot in format: HH:MM-HH:MM\n"
-                    f"Example: 10:00-11:00\n"
-                    f"Multiple slots: 10:00-11:00, 14:00-15:00\n\n"
-                    f"Type /cancel to abort.",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data=f"schedule_setup:{channel_id}")]])
-                )
-                
-            elif data.startswith('remove_schedule_slot:'):
-                parts = data.split(':')
-                channel_id = parts[1]
-                schedule_status = self.get_channel_schedule_status(channel_id)
-                
-                if not schedule_status['slots']:
-                    await query.edit_message_text(
-                        f"❌ No custom slots to remove for {channel_id}",
-                        reply_markup=self.get_keyboard('schedule_setup', channel_id)
-                    )
-                    return
-                
-                # Build remove buttons
-                buttons = []
-                for i, slot in enumerate(schedule_status['slots']):
-                    buttons.append([InlineKeyboardButton(f"❌ Remove: {slot}", callback_data=f"confirm_remove_slot:{channel_id}:{i}")])
-                buttons.append([InlineKeyboardButton("🔙 Back", callback_data=f"schedule_setup:{channel_id}")])
-                
-                await query.edit_message_text(
-                    f"🗑️ Remove Schedule Slot for {channel_id}\n\nSelect slot to remove:",
-                    reply_markup=InlineKeyboardMarkup(buttons)
-                )
-                
-            elif data.startswith('confirm_remove_slot:'):
-                parts = data.split(':')
-                channel_id = parts[1]
-                slot_index = int(parts[2])
-                
-                success, message = self.remove_schedule_slot(channel_id, slot_index)
-                await query.edit_message_text(
-                    f"{'✅' if success else '❌'} {message}",
-                    reply_markup=self.get_keyboard('schedule_setup', channel_id)
-                )
-                
-            elif data.startswith('clear_schedule:'):
-                channel_id = data.split(':', 1)[1]
-                
-                confirm_keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Yes, Clear All", callback_data=f"confirm_clear_schedule:{channel_id}"),
-                     InlineKeyboardButton("❌ No, Keep", callback_data=f"schedule_setup:{channel_id}")]
-                ])
-                
-                await query.edit_message_text(
-                    f"⚠️ Clear ALL custom schedule slots for {channel_id}?\n\n"
-                    f"This will revert to global schedule (06:00-00:00).",
-                    reply_markup=confirm_keyboard
-                )
-                
-            elif data.startswith('confirm_clear_schedule:'):
-                channel_id = data.split(':', 1)[1]
-                success, message = self.clear_all_schedule_slots(channel_id)
-                await query.edit_message_text(
-                    f"{'✅' if success else '❌'} {message}",
-                    reply_markup=self.get_keyboard('schedule_setup', channel_id)
                 )
                 
             elif data == 'add_channel':
@@ -4030,6 +4169,85 @@ Select an action:"""
             elif data == 'advanced':
                 await query.edit_message_text("🔄 Advanced Options", reply_markup=self.get_keyboard('advanced'))
                 
+            elif data == 'toggle_win_loss_text_menu':
+                await query.edit_message_text("💬 Win/Loss Text Settings\n\nSelect channel to toggle:", reply_markup=self.get_keyboard('toggle_win_loss_text_menu'))
+                
+            elif data == 'schedule_menu':
+                await query.edit_message_text("⏰ Custom Schedule\n\nSelect channel to set schedule:", reply_markup=self.get_keyboard('schedule_menu'))
+                
+            elif data.startswith('schedule_channel:'):
+                channel_id = data.split(':')[1]
+                schedule = self.channel_schedules.get(channel_id, [])
+                schedule_text = f"⏰ Schedule for {channel_id}\n\n"
+                if schedule:
+                    for i, slot in enumerate(schedule, 1):
+                        schedule_text += f"{i}. {slot['start']} - {slot['end']}\n"
+                    schedule_text += "\nClick on a slot to delete it."
+                else:
+                    schedule_text += "No schedule set (always active)\n\nSend format: HH:MM-HH:MM\nExample: 10:00-11:00\nOr multiple:\n10:00-11:00\n14:00-15:00\n20:00-21:00"
+                self.user_state[chat_id] = f'awaiting_schedule:{channel_id}'
+                await query.edit_message_text(schedule_text, reply_markup=self.get_keyboard('channel_schedule', channel_id))
+                
+            elif data.startswith('add_schedule:'):
+                channel_id = data.split(':')[1]
+                self.user_state[chat_id] = f'awaiting_schedule:{channel_id}'
+                await query.edit_message_text(f"⏰ Add Schedule for {channel_id}\n\nSend time slots in format:\nHH:MM-HH:MM\n\nExample:\n10:00-11:00\n14:00-15:00\n20:00-21:00\n\nSend multiple slots on separate lines.", 
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data=f"schedule_channel:{channel_id}")]]))
+                
+            elif data.startswith('clear_schedule:'):
+                channel_id = data.split(':')[1]
+                self.channel_schedules[channel_id] = []
+                self.save_config()
+                await query.edit_message_text(f"✅ Schedule cleared for {channel_id}!\nNow always active.", 
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="schedule_menu")]]))
+                
+            elif data.startswith('view_schedule:'):
+                channel_id = data.split(':')[1]
+                schedule = self.channel_schedules.get(channel_id, [])
+                now = self.get_ist_now()
+                current_time = f"{now.hour:02d}:{now.minute:02d}"
+                
+                schedule_text = f"⏰ Schedule for {channel_id}\n"
+                schedule_text += f"🕐 Current time: {current_time}\n\n"
+                
+                if schedule:
+                    for i, slot in enumerate(schedule, 1):
+                        is_active = self.is_channel_in_schedule(channel_id)
+                        status = "✅ ACTIVE" if is_active else "⏸️"
+                        schedule_text += f"{i}. {slot['start']} - {slot['end']} {status}\n"
+                else:
+                    schedule_text += "No schedule set (always active)"
+                
+                await query.edit_message_text(schedule_text, 
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="schedule_menu")]]))
+                
+            elif data.startswith('delete_schedule_slot:'):
+                parts = data.split(':')
+                channel_id = parts[1]
+                slot_index = int(parts[2])
+                if channel_id in self.channel_schedules and 0 <= slot_index < len(self.channel_schedules[channel_id]):
+                    self.channel_schedules[channel_id].pop(slot_index)
+                    self.save_config()
+                    await query.answer("Slot deleted!")
+                await query.edit_message_text(f"Schedule for {channel_id}:", 
+                    reply_markup=self.get_keyboard('channel_schedule', channel_id))
+                
+            elif data.startswith('toggle_win_loss_text:'):
+                channel_id = data.split(':')[1]
+                config = self.get_channel_config(channel_id)
+                current = config.get('send_win_loss_text', True)
+                config['send_win_loss_text'] = not current
+                self.save_config()
+                status = "ON ✅" if config['send_win_loss_text'] else "OFF ❌"
+                await query.edit_message_text(
+                    f"💬 Win/Loss Text for {channel_id}\n\nStatus: {status}\n\n"
+                    f"{'Text messages will be sent with media' if config['send_win_loss_text'] else 'Only media will be sent, no text'}",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(f"Toggle to {'OFF' if config['send_win_loss_text'] else 'ON'}", callback_data=f"toggle_win_loss_text:{channel_id}")],
+                        [InlineKeyboardButton("🔙 Back", callback_data="toggle_win_loss_text_menu")]
+                    ])
+                )
+                
             elif data == 'reset_table':
                 self.session_predictions = []
                 self.consecutive_losses = 0
@@ -4038,12 +4256,14 @@ Select an action:"""
                 self.session_losses = 0
                 self.predictions = {}
                 self.waiting_for_result = False
+                self.resolved_prediction_targets.clear()
                 self.break_message_sent = False
                 self.last_result_was_win = False
                 self.big_small_history.clear()
-                self.loss_prediction_history.clear()
+                self.prediction_history.clear()
                 self.waiting_for_win_before_break.clear()
                 self.pending_win_required.clear()
+                self.pending_good_night.clear()
                 self.pending_break = False
                 self.pending_break_next_session = None
                 self.session_start_sent_for_session.clear()
@@ -4351,35 +4571,47 @@ Select an action:"""
             await message.reply_text(f"✅ Promotional text updated for {channel_id}!")
             self.user_state.pop(chat_id, None)
             
-        elif state.startswith('awaiting_schedule_slot:') and text:
+        elif state.startswith('awaiting_schedule:') and text:
             channel_id = state.split(':', 1)[1]
-            
-            # Handle multiple slots separated by comma
-            slots = [s.strip() for s in text.split(',')]
-            added = []
-            failed = []
-            
-            for slot in slots:
-                success, result = self.add_schedule_slot(channel_id, slot)
-                if success:
-                    added.append(result)
+            # Parse schedule format: HH:MM-HH:MM or multiple slots
+            try:
+                slots = []
+                for line in text.strip().split('\n'):
+                    line = line.strip()
+                    if '-' in line:
+                        parts = line.split('-')
+                        if len(parts) == 2:
+                            start = parts[0].strip()
+                            end = parts[1].strip()
+                            # Validate format
+                            start_parts = start.split(':')
+                            end_parts = end.split(':')
+                            if len(start_parts) == 2 and len(end_parts) == 2:
+                                int(start_parts[0])  # Validate hour
+                                int(start_parts[1])  # Validate minute
+                                int(end_parts[0])
+                                int(end_parts[1])
+                                slots.append({'start': start, 'end': end})
+                
+                if slots:
+                    if channel_id not in self.channel_schedules:
+                        self.channel_schedules[channel_id] = []
+                    self.channel_schedules[channel_id] = slots
+                    self.save_config()
+                    
+                    schedule_text = f"✅ Schedule updated for {channel_id}!\n\n"
+                    for i, slot in enumerate(slots, 1):
+                        schedule_text += f"{i}. {slot['start']} - {slot['end']}\n"
+                    schedule_text += "\nPredictions will only be sent during these time slots."
+                    await message.reply_text(schedule_text)
                 else:
-                    failed.append(f"{slot}: {result}")
+                    await message.reply_text("❌ Invalid format! Use HH:MM-HH:MM (e.g., 10:00-11:00)")
+                
+            except ValueError:
+                await message.reply_text("❌ Invalid time format! Use HH:MM-HH:MM (e.g., 10:00-11:00)")
+            except Exception as e:
+                await message.reply_text(f"❌ Error: {str(e)}")
             
-            response = ""
-            if added:
-                response += f"✅ Added {len(added)} slot(s):\n"
-                for slot in added:
-                    response += f"  • {slot}\n"
-            if failed:
-                response += f"\n❌ Failed:\n"
-                for fail in failed:
-                    response += f"  • {fail}\n"
-            
-            if not response:
-                response = "No slots processed."
-            
-            await message.reply_text(response)
             self.user_state.pop(chat_id, None)
 
     def get_message_type_keyboard(self, channel_id):
@@ -4432,11 +4664,12 @@ Select an action:"""
             [InlineKeyboardButton("🗑️ Remove Channel", callback_data="remove_channel"), 
              InlineKeyboardButton("🎯 Custom Messages", callback_data="custom_messages_menu")],
             [InlineKeyboardButton("📝 Event Media", callback_data="event_media_menu"), 
-             InlineKeyboardButton("⏱️ Break Duration", callback_data="break_duration_menu")],
+             InlineKeyboardButton("⏰ Custom Schedule", callback_data="schedule_menu")],
             [InlineKeyboardButton("🤖 AI Management", callback_data="ai_management"),
              InlineKeyboardButton("📝 Templates", callback_data="templates_main_menu")],
             [InlineKeyboardButton("🔄 Advanced", callback_data="advanced"),
-             InlineKeyboardButton("📢 Broadcast All", callback_data="broadcast_all")]
+             InlineKeyboardButton("📢 Broadcast All", callback_data="broadcast_all")],
+            [InlineKeyboardButton("💬 Win/Loss Text", callback_data="toggle_win_loss_text_menu")]
         ]
         
         if keyboard_type == 'templates_main_menu':
@@ -4482,6 +4715,43 @@ Select an action:"""
                 [InlineKeyboardButton("📋 Select Channel", callback_data="select_channel_custom_messages")],
                 [InlineKeyboardButton("🔙 Back to Main", callback_data="main_menu")]
             ])
+        
+        if keyboard_type == 'toggle_win_loss_text_menu':
+            if not self.active_channels:
+                return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]])
+            buttons = []
+            for i in range(0, len(self.active_channels), 2):
+                row = []
+                row.append(InlineKeyboardButton(f"📢 {self.active_channels[i]}", callback_data=f"toggle_win_loss_text:{self.active_channels[i]}"))
+                if i+1 < len(self.active_channels):
+                    row.append(InlineKeyboardButton(f"📢 {self.active_channels[i+1]}", callback_data=f"toggle_win_loss_text:{self.active_channels[i+1]}"))
+                buttons.append(row)
+            buttons.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
+            return InlineKeyboardMarkup(buttons)
+        
+        if keyboard_type == 'schedule_menu':
+            if not self.active_channels:
+                return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]])
+            buttons = []
+            for i in range(0, len(self.active_channels), 2):
+                row = []
+                row.append(InlineKeyboardButton(f"📢 {self.active_channels[i]}", callback_data=f"schedule_channel:{self.active_channels[i]}"))
+                if i+1 < len(self.active_channels):
+                    row.append(InlineKeyboardButton(f"📢 {self.active_channels[i+1]}", callback_data=f"schedule_channel:{self.active_channels[i+1]}"))
+                buttons.append(row)
+            buttons.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
+            return InlineKeyboardMarkup(buttons)
+        
+        if keyboard_type == 'channel_schedule' and channel_id:
+            schedule = self.channel_schedules.get(channel_id, [])
+            buttons = []
+            if schedule:
+                for i, slot in enumerate(schedule):
+                    buttons.append([InlineKeyboardButton(f"⏰ {slot['start']}-{slot['end']}", callback_data=f"delete_schedule_slot:{channel_id}:{i}")])
+                buttons.append([InlineKeyboardButton("🗑️ Clear All", callback_data=f"clear_schedule:{channel_id}")])
+            buttons.append([InlineKeyboardButton("➕ Add Slot (Reply format: HH:MM-HH:MM)", callback_data=f"add_schedule:{channel_id}")])
+            buttons.append([InlineKeyboardButton("🔙 Back", callback_data="schedule_menu")])
+            return InlineKeyboardMarkup(buttons)
         
         if keyboard_type == 'select_channel_templates':
             if not self.active_channels:
@@ -4597,17 +4867,12 @@ Select an action:"""
             channel_status = self.is_channel_prediction_active(channel_id)
             status_text = "⏸️ Pause Predictions" if channel_status else "▶️ Start Predictions"
             
-            # Get schedule info
-            schedule_status = self.get_channel_schedule_status(channel_id)
-            schedule_text = f"⏰ Schedule ({len(schedule_status['slots'])} slots)" if schedule_status['slots'] else "⏰ Global Schedule"
-            
             return InlineKeyboardMarkup([
                 [InlineKeyboardButton(status_text, callback_data=f"toggle_single_channel_prediction:{channel_id}")],
                 [InlineKeyboardButton("🔗 Links Setup", callback_data=f"links_setup:{channel_id}"),
                  InlineKeyboardButton("📝 Templates", callback_data=f"channel_templates:{channel_id}")],
                 [InlineKeyboardButton("📝 Event Media", callback_data=f"event_media_channel:{channel_id}"),
                  InlineKeyboardButton("🎯 Custom Messages", callback_data=f"custom_messages_channel:{channel_id}")],
-                [InlineKeyboardButton(schedule_text, callback_data=f"schedule_setup:{channel_id}")],
                 [InlineKeyboardButton("🔙 Back to Main", callback_data="main_menu")]
             ])
         
@@ -4617,22 +4882,6 @@ Select an action:"""
                  InlineKeyboardButton("📢 Change Promo Text", callback_data=f"change_promo_text:{channel_id}")],
                 [InlineKeyboardButton("🔙 Back to Channel", callback_data=f"channel_config:{channel_id}")]
             ])
-        
-        if keyboard_type == 'schedule_setup' and channel_id:
-            schedule_status = self.get_channel_schedule_status(channel_id)
-            has_slots = len(schedule_status['slots']) > 0
-            
-            buttons = [
-                [InlineKeyboardButton("➕ Add Schedule Slot", callback_data=f"add_schedule_slot:{channel_id}")]
-            ]
-            
-            if has_slots:
-                buttons.append([InlineKeyboardButton("🗑️ Remove Slot", callback_data=f"remove_schedule_slot:{channel_id}")])
-                buttons.append([InlineKeyboardButton("🧹 Clear All Slots", callback_data=f"clear_schedule:{channel_id}")])
-            
-            buttons.append([InlineKeyboardButton("🔙 Back to Channel", callback_data=f"channel_config:{channel_id}")])
-            
-            return InlineKeyboardMarkup(buttons)
         
         if keyboard_type == 'advanced':
             return InlineKeyboardMarkup([
@@ -4674,11 +4923,9 @@ Select an action:"""
     
     async def main_loop(self, context):
         logging.info("🚀 Bot started - REAL AI PATTERN RECOGNITION")
-        logging.info("⏰ Schedule: 06:00 AM - 12:00 AM | 50min prediction + 10min break")
+        logging.info("⏰ Custom Schedule Mode - Each channel has its own schedule")
         logging.info("🌅 Morning Message: 5:00 AM")
         logging.info("🌙 Night Message: 12:00 AM")
-        logging.info("📢 Session Start: 5 minutes before each session")
-        logging.info("⏸️ Break Message: At end of each session (50th minute)")
         logging.info("🔄 AUTO-DELETE: Keeps last 3 loss predictions only")
         
         if self.use_user_account:
@@ -4711,80 +4958,190 @@ Select an action:"""
                 if current_hour == self.morning_message_hour and current_minute > self.morning_message_minute:
                     self.morning_message_sent = False
                 
-                # Night message at 12:00 AM
-                if current_hour == self.night_message_hour and current_minute == self.night_message_minute:
-                    if not self.night_message_sent:
-                        await self.send_good_night_message(context)
-                        self.night_message_sent = True
-                        self.morning_message_sent = False
+                # Night message at 12:00 AM - DISABLED: Good night now sent after last session's break
+                # if current_hour == self.night_message_hour and current_minute == self.night_message_minute:
+                #     if not self.night_message_sent:
+                #         await self.send_good_night_message(context)
+                #         self.night_message_sent = True
+                #         self.morning_message_sent = False
                 
                 if current_hour == self.night_message_hour and current_minute > self.night_message_minute:
                     self.night_message_sent = False
                 
-                # Check for session start messages (5 minutes before each session)
-                # Session starts at :00, so send at :55
-                # Skip 23:55 — midnight is end of day, not a new session start
-                if current_minute == 55 and current_hour != 23:
-                    next_hour = current_hour + 1
-                    # Send session start message for all active channels
-                    for channel in self.active_channels:
-                        if self.is_channel_prediction_active(channel):
-                            # Check if channel should be active in next hour based on its schedule
-                            # Create a fake time for next hour start
-                            next_session_start = ist_now.replace(hour=next_hour, minute=0, second=0)
-                            if self.is_channel_in_schedule(channel, next_session_start):
-                                # Check if we already sent for this hour
-                                if last_session_start_hour.get(channel) != next_hour:
-                                    await self.send_session_start_message(context, channel, next_hour)
-                                    last_session_start_hour[channel] = next_hour
-                
-                # Check for break messages at the end of each session (:50)
-                if current_minute == self.prediction_active_minutes:
-                    current_session_hour = current_hour
-                    for channel in self.active_channels:
-                        if self.is_channel_prediction_active(channel):
-                            # Check if channel was active during this session based on its schedule
-                            # Create a fake time for session start
-                            session_start_time = ist_now.replace(minute=0, second=0)
-                            if self.is_channel_in_schedule(channel, session_start_time):
-                                # Check if we already sent break for this hour
-                                if last_break_hour.get(channel) != current_session_hour:
-                                    await self.send_break_message_for_channel(context, channel, current_session_hour)
-                                    last_break_hour[channel] = current_session_hour
-                
-                # Process predictions during active hours - PER CHANNEL
-                # Check each channel individually based on its schedule
-                any_channel_active = False
-                channels_to_predict = []
+                # Check for session start messages based on custom schedules
+                # Send 5 minutes before each schedule slot starts
+                current_time_minutes = current_hour * 60 + current_minute
                 
                 for channel in self.active_channels:
+                    if not self.is_channel_prediction_active(channel):
+                        continue
+                    
+                    schedule = self.channel_schedules.get(channel, [])
+                    for slot in schedule:
+                        try:
+                            start_hour, start_min = map(int, slot['start'].split(':'))
+                            slot_start_minutes = start_hour * 60 + start_min
+                            
+                            # Send session start message 5 minutes before slot starts
+                            reminder_minutes = slot_start_minutes - 5
+                            if reminder_minutes < 0:
+                                reminder_minutes += 24 * 60  # Handle midnight
+                            
+                            if current_time_minutes == reminder_minutes:
+                                key = f"{channel}_{start_hour}_session"
+                                if last_session_start_hour.get(key) != current_hour:
+                                    await self.send_session_start_message(context, channel, start_hour)
+                                    last_session_start_hour[key] = current_hour
+                                    logging.info(f"📢 Session start message sent for {channel} at {slot['start']}")
+                        except Exception as e:
+                            continue
+                
+                # Check for break messages based on custom schedule slot ends
+                for channel in self.active_channels:
+                    if not self.is_channel_prediction_active(channel):
+                        continue
+                    
+                    schedule = self.channel_schedules.get(channel, [])
+                    if not schedule:
+                        continue
+                    
+                    normalized_schedule = [self.normalize_schedule_slot(slot) for slot in schedule]
+                    normalized_schedule = [slot for slot in normalized_schedule if slot]
+                    if not normalized_schedule:
+                        continue
+
+                    # Find the last session of the day for this channel
+                    last_slot_end = max(normalized_schedule, key=lambda s: int(s['end'].split(':')[0]) * 60 + int(s['end'].split(':')[1]))
+                    last_slot_end_hour, last_slot_end_min = map(int, last_slot_end['end'].split(':'))
+                    
+                    for slot in normalized_schedule:
+                        try:
+                            end_hour, end_min = map(int, slot['end'].split(':'))
+                            slot_end_minutes = end_hour * 60 + end_min
+                            
+                            # Send break message exactly at slot end time
+                            if current_time_minutes == slot_end_minutes:
+                                key = f"{channel}_{end_hour}_{end_min}_break"
+                                if last_break_hour.get(key) != current_time_minutes:
+                                    # Mark channel as out of schedule for break
+                                    self.channel_out_of_schedule.add(channel)
+                                    
+                                    # Check if this is the last session of the day
+                                    is_last_session = (end_hour == last_slot_end_hour and end_min == last_slot_end_min)
+                                    
+                                    # Check if we should wait for win before break
+                                    # If there's no win in current session, wait for win before sending break
+                                    if not self.last_result_was_win:
+                                        # No win yet - wait for win before break
+                                        self.waiting_for_win_before_break[channel] = True
+                                        self.pending_break = True
+                                        self.pending_break_next_session = "next session"
+                                        # Store if this is last session for later good night
+                                        if is_last_session:
+                                            self.pending_good_night[channel] = True
+                                        # Calculate next schedule slot for display
+                                        for next_slot in schedule:
+                                            next_start_hour, next_start_min = map(int, next_slot['start'].split(':'))
+                                            next_start_minutes = next_start_hour * 60 + next_start_min
+                                            if next_start_minutes > slot_end_minutes:
+                                                self.pending_break_next_session = self.format_time_12h(next_start_hour, next_start_min)
+                                                break
+                                        logging.info(f"⏸️ {channel}: No win yet, waiting for win before break")
+                                    else:
+                                        # There was a win - clear flags and send break immediately
+                                        self.waiting_for_win_before_break[channel] = False
+                                        self.pending_win_required[channel] = False
+                                        self.pending_break = False
+                                        self.pending_break_next_session = None
+                                        
+                                        # Calculate next schedule slot for display
+                                        next_slot_display = "next session"
+                                        for next_slot in schedule:
+                                            next_start_hour, next_start_min = map(int, next_slot['start'].split(':'))
+                                            next_start_minutes = next_start_hour * 60 + next_start_min
+                                            if next_start_minutes > slot_end_minutes:
+                                                next_slot_display = self.format_time_12h(next_start_hour, next_start_min)
+                                                break
+                                        
+                                        # Send break message with custom schedule info
+                                        await self.send_event_message(
+                                            context, channel, 'break',
+                                            next_session=next_slot_display,
+                                            break_duration=60  # Show as 60 min placeholder
+                                        )
+                                        
+                                        # Also send break media if available
+                                        break_media = self.get_event_media(channel, 'break')
+                                        if break_media:
+                                            await self.send_media_group(context, channel, break_media)
+                                        
+                                        # If this is the last session, send good night message
+                                        if is_last_session:
+                                            await self.send_event_message(context, channel, 'good_night')
+                                            logging.info(f"🌙 Good night message sent to {channel} after last session")
+                                        
+                                        logging.info(f"⏸️ Break message sent for {channel} at {slot['end']}")
+                                    
+                                    last_break_hour[key] = current_time_minutes
+                        except Exception:
+                            continue
+                
+                # Process predictions based on custom schedules
+                # Check if ANY channel is currently in schedule OR waiting for win before break
+                any_channel_active = False
+                for channel in self.active_channels:
                     if self.is_channel_prediction_active(channel):
-                        if self.is_channel_in_schedule(channel):
+                        if self.is_channel_in_schedule(channel) or self.waiting_for_win_before_break.get(channel, False):
                             any_channel_active = True
-                            channels_to_predict.append(channel)
+                            break
                 
                 if any_channel_active:
                     # Clear any pending break/waiting flags when session becomes active
-                    # This ensures session restarts properly after break
-                    if self.pending_break:
+                    # Only clear when a channel is actually in schedule, not when just waiting for win before break
+                    any_channel_in_schedule = any(self.is_channel_in_schedule(ch) and self.is_channel_prediction_active(ch) for ch in self.active_channels)
+                    if any_channel_in_schedule and self.pending_break:
                         self.pending_break = False
                         self.pending_break_next_session = None
                         for channel in self.active_channels:
                             self.waiting_for_win_before_break[channel] = False
                             self.pending_win_required[channel] = False
                     
+                    # Send immediate session start if just entered schedule and no prediction yet
+                    if not self.waiting_for_result and not self.current_prediction_period:
+                        for channel in self.active_channels:
+                            if self.is_channel_in_schedule(channel) and self.is_channel_prediction_active(channel):
+                                key = f"{channel}_immediate_session"
+                                if key not in last_session_start_hour or last_session_start_hour[key] != current_hour:
+                                    await self.send_session_start_message(context, channel, current_hour)
+                                    last_session_start_hour[key] = current_hour
+                                    logging.info(f"📢 Immediate session start sent for {channel}")
+                    
                     data = await self.fetch_live_data()
                     if data:
+                        # Only clear resolved targets at minute 0, don't reset current period
                         if current_minute == 0:
-                            self.waiting_for_result = False
-                            self.current_prediction_period = None
+                            self.resolved_prediction_targets.clear()
+                        
                         if self.waiting_for_result:
-                            handled = await self.check_result_and_send_next(context, data, channels_to_predict)
-                            if not handled and current_minute < self.prediction_active_minutes:
-                                self.waiting_for_result = False
-                                await self.send_first_prediction(context, data, channels_to_predict)
+                            handled = await self.check_result_and_send_next(context, data)
+                            if not handled:
+                                pass
                         else:
-                            await self.send_first_prediction(context, data, channels_to_predict)
+                            if not self.current_prediction_period and not self.waiting_for_result:
+                                await self.send_first_prediction(context, data)
+                
+                # Handle schedule transitions - send break when going out of schedule
+                for channel in self.active_channels:
+                    if not self.is_channel_in_schedule(channel):
+                        # Channel is out of schedule - mark for break
+                        if channel not in self.channel_out_of_schedule:
+                            self.channel_out_of_schedule.add(channel)
+                            logging.info(f"⏸️ {channel} is out of schedule - break mode")
+                    else:
+                        # Channel is in schedule - clear out-of-schedule flag
+                        if channel in self.channel_out_of_schedule:
+                            self.channel_out_of_schedule.discard(channel)
+                            logging.info(f"▶️ {channel} is back in schedule - active mode")
                 
                 if self.ai_total_predictions % 25 == 0 and self.ai_total_predictions > 0:
                     self.save_ai_model()
@@ -4855,7 +5212,7 @@ if __name__ == "__main__":
     
     API_ID = 22748653
     API_HASH = "29bba513726e776d0b5fd55dfa893c5a"
-    PHONE = "+919934755281"
+    PHONE = +919934755281
     
     bot = WinGoBotEnhanced(BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, phone=PHONE)
     bot.run()
